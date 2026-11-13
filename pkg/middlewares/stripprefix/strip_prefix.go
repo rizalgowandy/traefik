@@ -5,11 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/middlewares"
-	"github.com/traefik/traefik/v2/pkg/tracing"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares"
 )
 
 const (
@@ -20,48 +17,78 @@ const (
 
 // stripPrefix is a middleware used to strip prefix from an URL request.
 type stripPrefix struct {
-	next       http.Handler
-	prefixes   []string
-	forceSlash bool // TODO Must be removed (breaking), the default behavior must be forceSlash=false
-	name       string
+	next     http.Handler
+	prefixes []string
+	name     string
+
+	// Deprecated: Must be removed (breaking), the default behavior must be forceSlash=false
+	forceSlash bool
 }
 
 // New creates a new strip prefix middleware.
 func New(ctx context.Context, next http.Handler, config dynamic.StripPrefix, name string) (http.Handler, error) {
-	log.FromContext(middlewares.GetLoggerCtx(ctx, name, typeName)).Debug("Creating middleware")
+	logger := middlewares.GetLogger(ctx, name, typeName)
+	logger.Debug().Msg("Creating middleware")
+
+	if config.ForceSlash != nil {
+		logger.Warn().Msgf("`ForceSlash` option is deprecated, please remove any usage of this option.")
+	}
+	// Handle default value (here because of deprecation and the removal of setDefault).
+	forceSlash := config.ForceSlash != nil && *config.ForceSlash
+
+	prefixes := make([]string, len(config.Prefixes))
+	for i, p := range config.Prefixes {
+		prefixes[i] = strings.TrimSpace(p)
+	}
+
 	return &stripPrefix{
-		prefixes:   config.Prefixes,
-		forceSlash: config.ForceSlash,
+		prefixes:   prefixes,
 		next:       next,
 		name:       name,
+		forceSlash: forceSlash,
 	}, nil
 }
 
-func (s *stripPrefix) GetTracingInformation() (string, ext.SpanKindEnum) {
-	return s.name, tracing.SpanKindNoneEnum
+func (s *stripPrefix) GetTracingInformation() (string, string) {
+	return s.name, typeName
 }
 
 func (s *stripPrefix) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	logger := middlewares.GetLogger(req.Context(), s.name, typeName)
+
 	for _, prefix := range s.prefixes {
 		if strings.HasPrefix(req.URL.Path, prefix) {
-			req.URL.Path = s.getPrefixStripped(req.URL.Path, prefix)
+			req.URL.Path = s.getPathStripped(req.URL.Path, prefix)
 			if req.URL.RawPath != "" {
-				req.URL.RawPath = s.getPrefixStripped(req.URL.RawPath, prefix)
+				req.URL.RawPath = s.getRawPathStripped(req.URL.RawPath, prefix)
 			}
-			s.serveRequest(rw, req, strings.TrimSpace(prefix))
-			return
+
+			// Here we are sanitizing the URL when the path is not empty,
+			// as the JoinPath method is adding a leading slash if the path is empty
+			// to be aligned with ensureLeadingSlash behavior.
+			path := req.URL.Path
+			if path != "" {
+				req.URL = req.URL.JoinPath()
+			}
+
+			// Stop here if the normalization of the path produces a different path.
+			if path != req.URL.Path {
+				logger.Debug().Msgf("Rejecting request, sanitized path: %q is not equivalent to stripped path: %q", path, req.URL.Path)
+				http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				return
+			}
+
+			// Note: the header names aliasing the ForwardedPrefixHeader (e.g. X_Forwarded_Prefix) are not handled here,
+			// as the aliasHeadersStrategy entry point option is expected to be enabled to prevent header spoofing.
+			req.Header.Add(ForwardedPrefixHeader, prefix)
+			req.RequestURI = req.URL.RequestURI()
+			break
 		}
 	}
 	s.next.ServeHTTP(rw, req)
 }
 
-func (s *stripPrefix) serveRequest(rw http.ResponseWriter, req *http.Request, prefix string) {
-	req.Header.Add(ForwardedPrefixHeader, prefix)
-	req.RequestURI = req.URL.RequestURI()
-	s.next.ServeHTTP(rw, req)
-}
-
-func (s *stripPrefix) getPrefixStripped(urlPath, prefix string) string {
+func (s *stripPrefix) getPathStripped(urlPath, prefix string) string {
 	if s.forceSlash {
 		// Only for compatibility reason with the previous behavior,
 		// but the previous behavior is wrong.
@@ -70,6 +97,33 @@ func (s *stripPrefix) getPrefixStripped(urlPath, prefix string) string {
 	}
 
 	return ensureLeadingSlash(strings.TrimPrefix(urlPath, prefix))
+}
+
+func (s *stripPrefix) getRawPathStripped(rawPath, prefix string) string {
+	if s.forceSlash {
+		// Only for compatibility reason with the previous behavior,
+		// but the previous behavior is wrong.
+		// This needs to be removed in the next breaking version.
+		return "/" + strings.TrimPrefix(rawPath[encodedPrefixLen(rawPath, prefix):], "/")
+	}
+
+	return ensureLeadingSlash(rawPath[encodedPrefixLen(rawPath, prefix):])
+}
+
+// encodedPrefixLen returns the number of bytes in rawPath that correspond to
+// the decoded prefix, advancing 3 bytes per %XX sequence and 1 byte otherwise.
+func encodedPrefixLen(rawPath, decodedPrefix string) int {
+	decoded := 0
+	i := 0
+	for i < len(rawPath) && decoded < len(decodedPrefix) {
+		if rawPath[i] == '%' && i+2 < len(rawPath) {
+			i += 3
+		} else {
+			i++
+		}
+		decoded++
+	}
+	return i
 }
 
 func ensureLeadingSlash(str string) string {

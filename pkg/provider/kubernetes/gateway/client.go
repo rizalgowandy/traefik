@@ -5,89 +5,67 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"slices"
 	"time"
 
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/provider/kubernetes/k8s"
+	"github.com/traefik/traefik/v3/pkg/types"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
-	kubeerror "k8s.io/apimachinery/pkg/api/errors"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	kerror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
+	ktypes "k8s.io/apimachinery/pkg/types"
+	kinformers "k8s.io/client-go/informers"
+	kclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"sigs.k8s.io/gateway-api/apis/v1alpha1"
-	"sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
-	"sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
+	gatev1 "sigs.k8s.io/gateway-api/apis/v1"
+	gateclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
+	gateinformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 )
 
 const resyncPeriod = 10 * time.Minute
 
-type resourceEventHandler struct {
-	ev chan<- interface{}
-}
-
-func (reh *resourceEventHandler) OnAdd(obj interface{}) {
-	eventHandlerFunc(reh.ev, obj)
-}
-
-func (reh *resourceEventHandler) OnUpdate(oldObj, newObj interface{}) {
-	switch oldObj.(type) {
-	case *v1alpha1.GatewayClass:
-		// Skip update for gateway classes. We only manage addition or deletion for this cluster-wide resource.
-		return
-	default:
-		eventHandlerFunc(reh.ev, newObj)
-	}
-}
-
-func (reh *resourceEventHandler) OnDelete(obj interface{}) {
-	eventHandlerFunc(reh.ev, obj)
-}
-
-// Client is a client for the Provider master.
-// WatchAll starts the watch of the Provider resources and updates the stores.
-// The stores can then be accessed via the Get* functions.
-type Client interface {
-	WatchAll(namespaces []string, stopCh <-chan struct{}) (<-chan interface{}, error)
-
-	GetGatewayClasses() ([]*v1alpha1.GatewayClass, error)
-	UpdateGatewayStatus(gateway *v1alpha1.Gateway, gatewayStatus v1alpha1.GatewayStatus) error
-	UpdateGatewayClassStatus(gatewayClass *v1alpha1.GatewayClass, condition metav1.Condition) error
-	GetGateways() []*v1alpha1.Gateway
-	GetHTTPRoutes(namespaces []string, selector labels.Selector) ([]*v1alpha1.HTTPRoute, error)
-	GetTCPRoutes(namespaces []string, selector labels.Selector) ([]*v1alpha1.TCPRoute, error)
-	GetTLSRoutes(namespaces []string, selector labels.Selector) ([]*v1alpha1.TLSRoute, error)
-
-	GetService(namespace, name string) (*corev1.Service, bool, error)
-	GetSecret(namespace, name string) (*corev1.Secret, bool, error)
-	GetEndpoints(namespace, name string) (*corev1.Endpoints, bool, error)
-	GetNamespaces(selector labels.Selector) ([]string, error)
-}
-
 type clientWrapper struct {
-	csGateway versioned.Interface
-	csKube    kubernetes.Interface
+	csGateway gateclientset.Interface
+	csKube    kclientset.Interface
 
-	factoryNamespace    informers.SharedInformerFactory
-	factoryGatewayClass externalversions.SharedInformerFactory
-	factoriesGateway    map[string]externalversions.SharedInformerFactory
-	factoriesKube       map[string]informers.SharedInformerFactory
-	factoriesSecret     map[string]informers.SharedInformerFactory
+	factoryNamespace    kinformers.SharedInformerFactory
+	factoryGatewayClass gateinformers.SharedInformerFactory
+	factoriesGateway    map[string]gateinformers.SharedInformerFactory
+	factoriesKube       map[string]kinformers.SharedInformerFactory
+	factoriesSecret     map[string]kinformers.SharedInformerFactory
 
 	isNamespaceAll    bool
 	watchedNamespaces []string
 
+	gatewayClass  string
 	labelSelector string
+
+	// The ClusterTrustBundle API is optional, and an informer that cannot list or watch
+	// the resource blocks the cache sync, so both are checked before watching it.
+	clusterTrustBundleAPIServed bool
+	clusterTrustBundleAllowed   bool
 }
 
-func createClientFromConfig(c *rest.Config) (*clientWrapper, error) {
-	csGateway, err := versioned.NewForConfig(c)
+func createClientFromConfig(c *rest.Config, qps, burst int) (*clientWrapper, error) {
+	c.QPS = float32(qps)
+	c.Burst = burst
+
+	csGateway, err := gateclientset.NewForConfig(c)
 	if err != nil {
 		return nil, err
 	}
 
-	csKube, err := kubernetes.NewForConfig(c)
+	csKube, err := kclientset.NewForConfig(c)
 	if err != nil {
 		return nil, err
 	}
@@ -95,19 +73,19 @@ func createClientFromConfig(c *rest.Config) (*clientWrapper, error) {
 	return newClientImpl(csKube, csGateway), nil
 }
 
-func newClientImpl(csKube kubernetes.Interface, csGateway versioned.Interface) *clientWrapper {
+func newClientImpl(csKube kclientset.Interface, csGateway gateclientset.Interface) *clientWrapper {
 	return &clientWrapper{
 		csGateway:        csGateway,
 		csKube:           csKube,
-		factoriesGateway: make(map[string]externalversions.SharedInformerFactory),
-		factoriesKube:    make(map[string]informers.SharedInformerFactory),
-		factoriesSecret:  make(map[string]informers.SharedInformerFactory),
+		factoriesGateway: make(map[string]gateinformers.SharedInformerFactory),
+		factoriesKube:    make(map[string]kinformers.SharedInformerFactory),
+		factoriesSecret:  make(map[string]kinformers.SharedInformerFactory),
 	}
 }
 
 // newInClusterClient returns a new Provider client that is expected to run
 // inside the cluster.
-func newInClusterClient(endpoint string) (*clientWrapper, error) {
+func newInClusterClient(endpoint string, qps, burst int) (*clientWrapper, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create in-cluster configuration: %w", err)
@@ -117,28 +95,32 @@ func newInClusterClient(endpoint string) (*clientWrapper, error) {
 		config.Host = endpoint
 	}
 
-	return createClientFromConfig(config)
+	return createClientFromConfig(config, qps, burst)
 }
 
-func newExternalClusterClientFromFile(file string) (*clientWrapper, error) {
+func newExternalClusterClientFromFile(file string, qps, burst int) (*clientWrapper, error) {
 	configFromFlags, err := clientcmd.BuildConfigFromFlags("", file)
 	if err != nil {
 		return nil, err
 	}
-	return createClientFromConfig(configFromFlags)
+	return createClientFromConfig(configFromFlags, qps, burst)
 }
 
-// newExternalClusterClient returns a new Provider client that may run outside
-// of the cluster.
+// newExternalClusterClient returns a new Provider client that may run outside of the cluster.
 // The endpoint parameter must not be empty.
-func newExternalClusterClient(endpoint, token, caFilePath string) (*clientWrapper, error) {
+func newExternalClusterClient(endpoint, caFilePath string, token types.FileOrContent, qps, burst int) (*clientWrapper, error) {
 	if endpoint == "" {
 		return nil, errors.New("endpoint missing for external cluster client")
 	}
 
+	tokenData, err := token.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read token: %w", err)
+	}
+
 	config := &rest.Config{
 		Host:        endpoint,
-		BearerToken: token,
+		BearerToken: string(tokenData),
 	}
 
 	if caFilePath != "" {
@@ -150,13 +132,13 @@ func newExternalClusterClient(endpoint, token, caFilePath string) (*clientWrappe
 		config.TLSClientConfig = rest.TLSClientConfig{CAData: caData}
 	}
 
-	return createClientFromConfig(config)
+	return createClientFromConfig(config, qps, burst)
 }
 
 // WatchAll starts namespace-specific controllers for all relevant kinds.
-func (c *clientWrapper) WatchAll(namespaces []string, stopCh <-chan struct{}) (<-chan interface{}, error) {
-	eventCh := make(chan interface{}, 1)
-	eventHandler := &resourceEventHandler{ev: eventCh}
+func (c *clientWrapper) WatchAll(namespaces []string, stopCh <-chan struct{}) (<-chan any, error) {
+	eventCh := make(chan any, 1)
+	eventHandler := &k8s.ResourceEventHandler{Ev: eventCh}
 
 	if len(namespaces) == 0 {
 		namespaces = []string{metav1.NamespaceAll}
@@ -169,29 +151,107 @@ func (c *clientWrapper) WatchAll(namespaces []string, stopCh <-chan struct{}) (<
 		opts.LabelSelector = "owner!=helm"
 	}
 
-	labelSelectorOptions := func(options *metav1.ListOptions) {
-		options.LabelSelector = c.labelSelector
+	gatewayClassOptions := func(options *metav1.ListOptions) {
+		switch {
+		case c.labelSelector != "":
+			options.LabelSelector = c.labelSelector
+		case c.gatewayClass != "":
+			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", c.gatewayClass).String()
+		}
 	}
 
-	c.factoryNamespace = informers.NewSharedInformerFactory(c.csKube, resyncPeriod)
-	c.factoryNamespace.Core().V1().Namespaces().Informer().AddEventHandler(eventHandler)
+	c.factoryNamespace = kinformers.NewSharedInformerFactoryWithOptions(c.csKube, resyncPeriod, kinformers.WithTransform(k8s.StripManagedFields))
+	_, err := c.factoryNamespace.Core().V1().Namespaces().Informer().AddEventHandler(eventHandler)
+	if err != nil {
+		return nil, err
+	}
 
-	c.factoryGatewayClass = externalversions.NewSharedInformerFactoryWithOptions(c.csGateway, resyncPeriod, externalversions.WithTweakListOptions(labelSelectorOptions))
-	c.factoryGatewayClass.Networking().V1alpha1().GatewayClasses().Informer().AddEventHandler(eventHandler)
+	c.clusterTrustBundleAPIServed, err = c.isClusterTrustBundleAPIServed()
+	if err != nil {
+		return nil, fmt.Errorf("checking ClusterTrustBundle API availability: %w", err)
+	}
+
+	if c.clusterTrustBundleAPIServed {
+		c.clusterTrustBundleAllowed, err = c.isClusterTrustBundleAllowed()
+		if err != nil {
+			return nil, fmt.Errorf("checking ClusterTrustBundle permissions: %w", err)
+		}
+	}
+
+	if c.clusterTrustBundleAPIServed && c.clusterTrustBundleAllowed {
+		_, err = c.factoryNamespace.Certificates().V1().ClusterTrustBundles().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c.factoryGatewayClass = gateinformers.NewSharedInformerFactoryWithOptions(c.csGateway, resyncPeriod, gateinformers.WithTweakListOptions(gatewayClassOptions), gateinformers.WithTransform(k8s.StripManagedFields))
+	_, err = c.factoryGatewayClass.Gateway().V1().GatewayClasses().Informer().AddEventHandler(eventHandler)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, ns := range namespaces {
-		factoryGateway := externalversions.NewSharedInformerFactoryWithOptions(c.csGateway, resyncPeriod, externalversions.WithNamespace(ns))
-		factoryGateway.Networking().V1alpha1().Gateways().Informer().AddEventHandler(eventHandler)
-		factoryGateway.Networking().V1alpha1().HTTPRoutes().Informer().AddEventHandler(eventHandler)
-		factoryGateway.Networking().V1alpha1().TCPRoutes().Informer().AddEventHandler(eventHandler)
-		factoryGateway.Networking().V1alpha1().TLSRoutes().Informer().AddEventHandler(eventHandler)
+		factoryKube := kinformers.NewSharedInformerFactoryWithOptions(c.csKube, resyncPeriod, kinformers.WithNamespace(ns), kinformers.WithTransform(k8s.StripManagedFields))
+		_, err = factoryKube.Core().V1().Services().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+		endpointSliceInformer := factoryKube.Discovery().V1().EndpointSlices().Informer()
+		if err = endpointSliceInformer.AddIndexers(k8s.EndpointSliceByServiceNameIndexers); err != nil {
+			return nil, err
+		}
+		_, err = endpointSliceInformer.AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
 
-		factoryKube := informers.NewSharedInformerFactoryWithOptions(c.csKube, resyncPeriod, informers.WithNamespace(ns))
-		factoryKube.Core().V1().Services().Informer().AddEventHandler(eventHandler)
-		factoryKube.Core().V1().Endpoints().Informer().AddEventHandler(eventHandler)
+		factoryGateway := gateinformers.NewSharedInformerFactoryWithOptions(c.csGateway, resyncPeriod, gateinformers.WithNamespace(ns), gateinformers.WithTransform(k8s.StripManagedFields))
+		_, err = factoryGateway.Gateway().V1().Gateways().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+		_, err = factoryGateway.Gateway().V1().HTTPRoutes().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+		_, err = factoryGateway.Gateway().V1().GRPCRoutes().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+		_, err = factoryGateway.Gateway().V1().ReferenceGrants().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+		_, err = factoryGateway.Gateway().V1().BackendTLSPolicies().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+		_, err = factoryKube.Core().V1().ConfigMaps().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
 
-		factorySecret := informers.NewSharedInformerFactoryWithOptions(c.csKube, resyncPeriod, informers.WithNamespace(ns), informers.WithTweakListOptions(notOwnedByHelm))
-		factorySecret.Core().V1().Secrets().Informer().AddEventHandler(eventHandler)
+		_, err = factoryGateway.Gateway().V1().TLSRoutes().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = factoryGateway.Gateway().V1().ListenerSets().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = factoryGateway.Gateway().V1().TCPRoutes().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
+
+		factorySecret := kinformers.NewSharedInformerFactoryWithOptions(c.csKube, resyncPeriod, kinformers.WithNamespace(ns), kinformers.WithTweakListOptions(notOwnedByHelm), kinformers.WithTransform(k8s.StripManagedFields))
+		_, err = factorySecret.Core().V1().Secrets().Informer().AddEventHandler(eventHandler)
+		if err != nil {
+			return nil, err
+		}
 
 		c.factoriesGateway[ns] = factoryGateway
 		c.factoriesKube[ns] = factoryKube
@@ -242,7 +302,7 @@ func (c *clientWrapper) WatchAll(namespaces []string, stopCh <-chan struct{}) (<
 	return eventCh, nil
 }
 
-func (c *clientWrapper) GetNamespaces(selector labels.Selector) ([]string, error) {
+func (c *clientWrapper) ListNamespaces(selector labels.Selector) ([]string, error) {
 	ns, err := c.factoryNamespace.Core().V1().Namespaces().Lister().List(selector)
 	if err != nil {
 		return nil, err
@@ -251,7 +311,7 @@ func (c *clientWrapper) GetNamespaces(selector labels.Selector) ([]string, error
 	var namespaces []string
 	for _, namespace := range ns {
 		if !c.isWatchedNamespace(namespace.Name) {
-			log.WithoutContext().Warnf("Namespace %q is not within  watched namespaces", selector, namespace)
+			log.Warn().Msgf("Namespace %q is not within %q watched namespaces", selector, namespace)
 			continue
 		}
 		namespaces = append(namespaces, namespace.Name)
@@ -259,22 +319,12 @@ func (c *clientWrapper) GetNamespaces(selector labels.Selector) ([]string, error
 	return namespaces, nil
 }
 
-func (c *clientWrapper) GetHTTPRoutes(namespaces []string, selector labels.Selector) ([]*v1alpha1.HTTPRoute, error) {
-	var httpRoutes []*v1alpha1.HTTPRoute
-	for _, namespace := range namespaces {
-		if !c.isWatchedNamespace(namespace) {
-			log.WithoutContext().Warnf("Failed to get HTTPRoutes with labels selector %s: %q is not within watched namespaces", selector, namespace)
-			continue
-		}
-
-		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Networking().V1alpha1().HTTPRoutes().Lister().HTTPRoutes(namespace).List(selector)
+func (c *clientWrapper) ListHTTPRoutes() ([]*gatev1.HTTPRoute, error) {
+	var httpRoutes []*gatev1.HTTPRoute
+	for _, namespace := range c.watchedNamespaces {
+		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Gateway().V1().HTTPRoutes().Lister().HTTPRoutes(namespace).List(labels.Everything())
 		if err != nil {
-			return nil, err
-		}
-
-		if len(routes) == 0 {
-			log.WithoutContext().Debugf("No HTTPRoutes found in %q namespace with labels selector %s", namespace, selector)
-			continue
+			return nil, fmt.Errorf("listing HTTP routes in namespace %s", namespace)
 		}
 
 		httpRoutes = append(httpRoutes, routes...)
@@ -283,59 +333,68 @@ func (c *clientWrapper) GetHTTPRoutes(namespaces []string, selector labels.Selec
 	return httpRoutes, nil
 }
 
-func (c *clientWrapper) GetTCPRoutes(namespaces []string, selector labels.Selector) ([]*v1alpha1.TCPRoute, error) {
-	var tcpRoutes []*v1alpha1.TCPRoute
-	for _, namespace := range namespaces {
-		if !c.isWatchedNamespace(namespace) {
-			log.WithoutContext().Warnf("Failed to get TCPRoutes with labels selector %s: %q is not within watched namespaces", selector, namespace)
-			continue
-		}
-
-		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Networking().V1alpha1().TCPRoutes().Lister().TCPRoutes(namespace).List(selector)
+func (c *clientWrapper) ListGRPCRoutes() ([]*gatev1.GRPCRoute, error) {
+	var grpcRoutes []*gatev1.GRPCRoute
+	for _, namespace := range c.watchedNamespaces {
+		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Gateway().V1().GRPCRoutes().Lister().GRPCRoutes(namespace).List(labels.Everything())
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("listing GRPC routes in namespace %s", namespace)
 		}
 
-		if len(routes) == 0 {
-			log.WithoutContext().Debugf("No TCPRoutes found in %q namespace with labels selector %s", namespace, selector)
-			continue
+		grpcRoutes = append(grpcRoutes, routes...)
+	}
+
+	return grpcRoutes, nil
+}
+
+func (c *clientWrapper) ListTCPRoutes() ([]*gatev1.TCPRoute, error) {
+	var tcpRoutes []*gatev1.TCPRoute
+	for _, namespace := range c.watchedNamespaces {
+		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Gateway().V1().TCPRoutes().Lister().TCPRoutes(namespace).List(labels.Everything())
+		if err != nil {
+			return nil, fmt.Errorf("listing TCP routes in namespace %s", namespace)
 		}
 
 		tcpRoutes = append(tcpRoutes, routes...)
 	}
+
 	return tcpRoutes, nil
 }
 
-func (c *clientWrapper) GetTLSRoutes(namespaces []string, selector labels.Selector) ([]*v1alpha1.TLSRoute, error) {
-	var tlsRoutes []*v1alpha1.TLSRoute
-	for _, namespace := range namespaces {
-		if !c.isWatchedNamespace(namespace) {
-			log.WithoutContext().Warnf("Failed to get TLSRoutes with labels selector %s: %q is not within watched namespaces", selector, namespace)
-			continue
-		}
-
-		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Networking().V1alpha1().TLSRoutes().Lister().TLSRoutes(namespace).List(selector)
+func (c *clientWrapper) ListTLSRoutes() ([]*gatev1.TLSRoute, error) {
+	var tlsRoutes []*gatev1.TLSRoute
+	for _, namespace := range c.watchedNamespaces {
+		routes, err := c.factoriesGateway[c.lookupNamespace(namespace)].Gateway().V1().TLSRoutes().Lister().TLSRoutes(namespace).List(labels.Everything())
 		if err != nil {
-			return nil, err
-		}
-
-		if len(routes) == 0 {
-			log.WithoutContext().Debugf("No TLSRoutes found in %q namespace with labels selector %s", namespace, selector)
-			continue
+			return nil, fmt.Errorf("listing TLS routes in namespace %s", namespace)
 		}
 
 		tlsRoutes = append(tlsRoutes, routes...)
 	}
+
 	return tlsRoutes, nil
 }
 
-func (c *clientWrapper) GetGateways() []*v1alpha1.Gateway {
-	var result []*v1alpha1.Gateway
+func (c *clientWrapper) ListReferenceGrants(namespace string) ([]*gatev1.ReferenceGrant, error) {
+	if !c.isWatchedNamespace(namespace) {
+		return nil, fmt.Errorf("failed to get ReferenceGrants: namespace %s is not within watched namespaces", namespace)
+	}
+
+	referenceGrants, err := c.factoriesGateway[c.lookupNamespace(namespace)].Gateway().V1().ReferenceGrants().Lister().ReferenceGrants(namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	return referenceGrants, nil
+}
+
+func (c *clientWrapper) ListGateways() []*gatev1.Gateway {
+	var result []*gatev1.Gateway
 
 	for ns, factory := range c.factoriesGateway {
-		gateways, err := factory.Networking().V1alpha1().Gateways().Lister().List(labels.Everything())
+		gateways, err := factory.Gateway().V1().Gateways().Lister().Gateways(ns).List(labels.Everything())
 		if err != nil {
-			log.WithoutContext().Errorf("Failed to list Gateways in namespace %s: %v", ns, err)
+			log.Error().Err(err).Msgf("Failed to list Gateways in namespace %s", ns)
 			continue
 		}
 		result = append(result, gateways...)
@@ -344,187 +403,653 @@ func (c *clientWrapper) GetGateways() []*v1alpha1.Gateway {
 	return result
 }
 
-func (c *clientWrapper) GetGatewayClasses() ([]*v1alpha1.GatewayClass, error) {
-	return c.factoryGatewayClass.Networking().V1alpha1().GatewayClasses().Lister().List(labels.Everything())
+func (c *clientWrapper) ListListenerSets() []*gatev1.ListenerSet {
+	var result []*gatev1.ListenerSet
+
+	for ns, factory := range c.factoriesGateway {
+		listenerSets, err := factory.Gateway().V1().ListenerSets().Lister().ListenerSets(ns).List(labels.Everything())
+		if err != nil {
+			log.Error().Err(err).Msgf("Failed to list ListenerSets in namespace %s", ns)
+			continue
+		}
+		result = append(result, listenerSets...)
+	}
+
+	return result
 }
 
-func (c *clientWrapper) UpdateGatewayClassStatus(gatewayClass *v1alpha1.GatewayClass, condition metav1.Condition) error {
-	gc := gatewayClass.DeepCopy()
+func (c *clientWrapper) ListGatewayClasses() ([]*gatev1.GatewayClass, error) {
+	return c.factoryGatewayClass.Gateway().V1().GatewayClasses().Lister().List(labels.Everything())
+}
 
-	var newConditions []metav1.Condition
-	for _, cond := range gc.Status.Conditions {
-		// No update for identical condition.
-		if cond.Type == condition.Type && cond.Status == condition.Status {
-			return nil
-		}
+// ListEndpointSlicesForService returns the EndpointSlices for the given service name in the given namespace.
+func (c *clientWrapper) ListEndpointSlicesForService(namespace, serviceName string) ([]*discoveryv1.EndpointSlice, error) {
+	if !c.isWatchedNamespace(namespace) {
+		return nil, fmt.Errorf("failed to get endpointslices for service %s/%s: namespace is not within watched namespaces", namespace, serviceName)
+	}
 
-		// Keep other condition types.
-		if cond.Type != condition.Type {
-			newConditions = append(newConditions, cond)
+	return k8s.EndpointSlicesByServiceName(
+		c.factoriesKube[c.lookupNamespace(namespace)].Discovery().V1().EndpointSlices().Informer().GetIndexer(),
+		namespace,
+		serviceName,
+	)
+}
+
+// ListBackendTLSPoliciesForService returns the BackendTLSPolicy for the given service name in the given namespace.
+func (c *clientWrapper) ListBackendTLSPoliciesForService(namespace, serviceName string) ([]*gatev1.BackendTLSPolicy, error) {
+	if !c.isWatchedNamespace(namespace) {
+		return nil, fmt.Errorf("failed to get BackendTLSPolicies for service %s/%s: namespace is not within watched namespaces", namespace, serviceName)
+	}
+
+	policies, err := c.factoriesGateway[c.lookupNamespace(namespace)].Gateway().V1().BackendTLSPolicies().Lister().BackendTLSPolicies(namespace).List(labels.Everything())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list BackendTLSPolicies in namespace %s", namespace)
+	}
+
+	var servicePolicies []*gatev1.BackendTLSPolicy
+	for _, policy := range policies {
+		for _, ref := range policy.Spec.TargetRefs {
+			// The policy does not target the service.
+			if (ref.Group != "" && ref.Group != groupCore) || ref.Kind != kindService || string(ref.Name) != serviceName {
+				continue
+			}
+
+			servicePolicies = append(servicePolicies, policy)
 		}
 	}
 
-	// Append the condition to update.
-	newConditions = append(newConditions, condition)
-	gc.Status.Conditions = newConditions
+	return servicePolicies, nil
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// GetClusterTrustBundle returns the named ClusterTrustBundle.
+func (c *clientWrapper) GetClusterTrustBundle(name string) (*certificatesv1.ClusterTrustBundle, error) {
+	return c.factoryNamespace.Certificates().V1().ClusterTrustBundles().Lister().Get(name)
+}
 
-	_, err := c.csGateway.NetworkingV1alpha1().GatewayClasses().UpdateStatus(ctx, gc, metav1.UpdateOptions{})
+// GetService returns the named service from the given namespace.
+func (c *clientWrapper) GetService(namespace, name string) (*corev1.Service, error) {
+	if !c.isWatchedNamespace(namespace) {
+		return nil, fmt.Errorf("failed to get service %s/%s: namespace is not within watched namespaces", namespace, name)
+	}
+	return c.factoriesKube[c.lookupNamespace(namespace)].Core().V1().Services().Lister().Services(namespace).Get(name)
+}
+
+// GetSecret returns the named secret from the given namespace.
+func (c *clientWrapper) GetSecret(namespace, name string) (*corev1.Secret, error) {
+	if !c.isWatchedNamespace(namespace) {
+		return nil, fmt.Errorf("failed to get secret %s/%s: namespace is not within watched namespaces", namespace, name)
+	}
+	return c.factoriesSecret[c.lookupNamespace(namespace)].Core().V1().Secrets().Lister().Secrets(namespace).Get(name)
+}
+
+// GetConfigMap returns the named configMap from the given namespace.
+func (c *clientWrapper) GetConfigMap(namespace, name string) (*corev1.ConfigMap, error) {
+	if !c.isWatchedNamespace(namespace) {
+		return nil, fmt.Errorf("failed to get configMap %s/%s: namespace is not within watched namespaces", namespace, name)
+	}
+	return c.factoriesKube[c.lookupNamespace(namespace)].Core().V1().ConfigMaps().Lister().ConfigMaps(namespace).Get(name)
+}
+
+func (c *clientWrapper) UpdateGatewayClassStatus(ctx context.Context, name string, status gatev1.GatewayClassStatus) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentGatewayClass, err := c.factoryGatewayClass.Gateway().V1().GatewayClasses().Lister().Get(name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		if conditionsEqual(currentGatewayClass.Status.Conditions, status.Conditions) {
+			return nil
+		}
+
+		currentGatewayClass = currentGatewayClass.DeepCopy()
+		currentGatewayClass.Status = status
+
+		if _, err = c.csGateway.GatewayV1().GatewayClasses().UpdateStatus(ctx, currentGatewayClass, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to update GatewayClass %q status: %w", gatewayClass.Name, err)
+		return fmt.Errorf("failed to update GatewayClass %s status: %w", name, err)
 	}
 
 	return nil
 }
 
-func (c *clientWrapper) UpdateGatewayStatus(gateway *v1alpha1.Gateway, gatewayStatus v1alpha1.GatewayStatus) error {
+func (c *clientWrapper) UpdateGatewayStatus(ctx context.Context, gateway ktypes.NamespacedName, status gatev1.GatewayStatus) error {
 	if !c.isWatchedNamespace(gateway.Namespace) {
 		return fmt.Errorf("cannot update Gateway status %s/%s: namespace is not within watched namespaces", gateway.Namespace, gateway.Name)
 	}
 
-	if statusEquals(gateway.Status, gatewayStatus) {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentGateway, err := c.factoriesGateway[c.lookupNamespace(gateway.Namespace)].Gateway().V1().Gateways().Lister().Gateways(gateway.Namespace).Get(gateway.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		if gatewayStatusEqual(withoutForeignConditions(currentGateway.Status), status) {
+			return nil
+		}
+
+		currentGateway = currentGateway.DeepCopy()
+		currentGateway.Status = mergeGatewayStatus(currentGateway.Status, status)
+
+		if _, err = c.csGateway.GatewayV1().Gateways(gateway.Namespace).UpdateStatus(ctx, currentGateway, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
 		return nil
-	}
-
-	g := gateway.DeepCopy()
-	g.Status = gatewayStatus
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err := c.csGateway.NetworkingV1alpha1().Gateways(gateway.Namespace).UpdateStatus(ctx, g, metav1.UpdateOptions{})
+	})
 	if err != nil {
-		return fmt.Errorf("failed to update Gateway %q status: %w", gateway.Name, err)
+		return fmt.Errorf("failed to update Gateway %s/%s status: %w", gateway.Namespace, gateway.Name, err)
 	}
 
 	return nil
 }
 
-func statusEquals(oldStatus, newStatus v1alpha1.GatewayStatus) bool {
-	if len(oldStatus.Listeners) != len(newStatus.Listeners) {
-		return false
+func (c *clientWrapper) UpdateHTTPRouteStatus(ctx context.Context, route ktypes.NamespacedName, gateways []gatewayWithListeners, status gatev1.HTTPRouteStatus) error {
+	if !c.isWatchedNamespace(route.Namespace) {
+		return fmt.Errorf("updating HTTPRoute status %s/%s: namespace is not within watched namespaces", route.Namespace, route.Name)
 	}
 
-	if !conditionsEquals(oldStatus.Conditions, newStatus.Conditions) {
-		return false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentRoute, err := c.factoriesGateway[c.lookupNamespace(route.Namespace)].Gateway().V1().HTTPRoutes().Lister().HTTPRoutes(route.Namespace).Get(route.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		parentStatuses := mergeRouteParentStatuses(route.Namespace, currentRoute.Status.Parents, status.Parents, gateways)
+
+		// do not update status when nothing has changed.
+		if routeParentStatusesEqual(currentRoute.Status.Parents, parentStatuses) {
+			return nil
+		}
+
+		currentRoute = currentRoute.DeepCopy()
+		currentRoute.Status = gatev1.HTTPRouteStatus{
+			Parents: parentStatuses,
+		}
+
+		if _, err = c.csGateway.GatewayV1().HTTPRoutes(route.Namespace).UpdateStatus(ctx, currentRoute, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update HTTPRoute %s/%s status: %w", route.Namespace, route.Name, err)
 	}
 
-	listenerMatches := 0
-	for _, newListener := range newStatus.Listeners {
-		for _, oldListener := range oldStatus.Listeners {
-			if newListener.Port == oldListener.Port {
-				if !conditionsEquals(newListener.Conditions, oldListener.Conditions) {
-					return false
-				}
+	return nil
+}
 
-				listenerMatches++
+func (c *clientWrapper) UpdateGRPCRouteStatus(ctx context.Context, route ktypes.NamespacedName, gateways []gatewayWithListeners, status gatev1.GRPCRouteStatus) error {
+	if !c.isWatchedNamespace(route.Namespace) {
+		return fmt.Errorf("updating GRPCRoute status %s/%s: namespace is not within watched namespaces", route.Namespace, route.Name)
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentRoute, err := c.factoriesGateway[c.lookupNamespace(route.Namespace)].Gateway().V1().GRPCRoutes().Lister().GRPCRoutes(route.Namespace).Get(route.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		parentStatuses := mergeRouteParentStatuses(route.Namespace, currentRoute.Status.Parents, status.Parents, gateways)
+
+		// do not update status when nothing has changed.
+		if routeParentStatusesEqual(currentRoute.Status.Parents, parentStatuses) {
+			return nil
+		}
+
+		currentRoute = currentRoute.DeepCopy()
+		currentRoute.Status = gatev1.GRPCRouteStatus{
+			Parents: parentStatuses,
+		}
+
+		if _, err = c.csGateway.GatewayV1().GRPCRoutes(route.Namespace).UpdateStatus(ctx, currentRoute, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update GRPCRoute %q status: %w", route.Name, err)
+	}
+
+	return nil
+}
+
+func (c *clientWrapper) UpdateTCPRouteStatus(ctx context.Context, route ktypes.NamespacedName, gateways []gatewayWithListeners, status gatev1.TCPRouteStatus) error {
+	if !c.isWatchedNamespace(route.Namespace) {
+		return fmt.Errorf("updating TCPRoute status %s/%s: namespace is not within watched namespaces", route.Namespace, route.Name)
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentRoute, err := c.factoriesGateway[c.lookupNamespace(route.Namespace)].Gateway().V1().TCPRoutes().Lister().TCPRoutes(route.Namespace).Get(route.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		parentStatuses := mergeRouteParentStatuses(route.Namespace, currentRoute.Status.Parents, status.Parents, gateways)
+
+		// do not update status when nothing has changed.
+		if routeParentStatusesEqual(currentRoute.Status.Parents, parentStatuses) {
+			return nil
+		}
+
+		currentRoute = currentRoute.DeepCopy()
+		currentRoute.Status = gatev1.TCPRouteStatus{
+			Parents: parentStatuses,
+		}
+
+		if _, err = c.csGateway.GatewayV1().TCPRoutes(route.Namespace).UpdateStatus(ctx, currentRoute, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update TCPRoute %s/%s status: %w", route.Namespace, route.Name, err)
+	}
+
+	return nil
+}
+
+func (c *clientWrapper) UpdateTLSRouteStatus(ctx context.Context, route ktypes.NamespacedName, gateways []gatewayWithListeners, status gatev1.TLSRouteStatus) error {
+	if !c.isWatchedNamespace(route.Namespace) {
+		return fmt.Errorf("updating TLSRoute status %s/%s: namespace is not within watched namespaces", route.Namespace, route.Name)
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentRoute, err := c.factoriesGateway[c.lookupNamespace(route.Namespace)].Gateway().V1().TLSRoutes().Lister().TLSRoutes(route.Namespace).Get(route.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		parentStatuses := mergeRouteParentStatuses(route.Namespace, currentRoute.Status.Parents, status.Parents, gateways)
+
+		// do not update status when nothing has changed.
+		if routeParentStatusesEqual(currentRoute.Status.Parents, parentStatuses) {
+			return nil
+		}
+
+		currentRoute = currentRoute.DeepCopy()
+		currentRoute.Status = gatev1.TLSRouteStatus{
+			Parents: parentStatuses,
+		}
+
+		if _, err = c.csGateway.GatewayV1().TLSRoutes(route.Namespace).UpdateStatus(ctx, currentRoute, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update TLSRoute %s/%s status: %w", route.Namespace, route.Name, err)
+	}
+
+	return nil
+}
+
+func (c *clientWrapper) UpdateBackendTLSPolicyStatus(ctx context.Context, policy ktypes.NamespacedName, status gatev1.PolicyStatus) error {
+	if !c.isWatchedNamespace(policy.Namespace) {
+		return fmt.Errorf("updating BackendTLSPolicy status %s/%s: namespace is not within watched namespaces", policy.Namespace, policy.Name)
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentPolicy, err := c.factoriesGateway[c.lookupNamespace(policy.Namespace)].Gateway().V1().BackendTLSPolicies().Lister().BackendTLSPolicies(policy.Namespace).Get(policy.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		ancestorStatuses := make([]gatev1.PolicyAncestorStatus, len(status.Ancestors))
+		copy(ancestorStatuses, status.Ancestors)
+
+		for _, ancestorStatus := range currentPolicy.Status.Ancestors {
+			// Keep statuses added by other gateway controllers.
+			if ancestorStatus.ControllerName != controllerName {
+				ancestorStatuses = append(ancestorStatuses, ancestorStatus)
+				continue
 			}
 		}
-	}
 
-	return listenerMatches == len(oldStatus.Listeners)
-}
-
-func conditionsEquals(conditionsA, conditionsB []metav1.Condition) bool {
-	if len(conditionsA) != len(conditionsB) {
-		return false
-	}
-
-	conditionMatches := 0
-	for _, conditionA := range conditionsA {
-		for _, conditionB := range conditionsB {
-			if conditionA.Type == conditionB.Type {
-				if conditionA.Reason != conditionB.Reason || conditionA.Status != conditionB.Status || conditionA.Message != conditionB.Message {
-					return false
-				}
-				conditionMatches++
-			}
+		if len(ancestorStatuses) > 16 {
+			return fmt.Errorf("failed to update BackendTLSPolicy %s/%s status: PolicyAncestor statuses count exceeds 16", policy.Namespace, policy.Name)
 		}
+
+		// Do not update status when nothing has changed.
+		if policyAncestorStatusesEqual(currentPolicy.Status.Ancestors, ancestorStatuses) {
+			return nil
+		}
+
+		currentPolicy = currentPolicy.DeepCopy()
+		currentPolicy.Status = gatev1.PolicyStatus{
+			Ancestors: ancestorStatuses,
+		}
+
+		if _, err = c.csGateway.GatewayV1().BackendTLSPolicies(policy.Namespace).UpdateStatus(ctx, currentPolicy, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error)
+			// so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update BackendTLSPolicy %s/%s status: %w", policy.Namespace, policy.Name, err)
 	}
 
-	return conditionMatches == len(conditionsA)
+	return nil
 }
 
-// GetService returns the named service from the given namespace.
-func (c *clientWrapper) GetService(namespace, name string) (*corev1.Service, bool, error) {
-	if !c.isWatchedNamespace(namespace) {
-		return nil, false, fmt.Errorf("failed to get service %s/%s: namespace is not within watched namespaces", namespace, name)
+func (c *clientWrapper) UpdateListenerSetStatus(ctx context.Context, listenerSet ktypes.NamespacedName, status gatev1.ListenerSetStatus) error {
+	if !c.isWatchedNamespace(listenerSet.Namespace) {
+		return fmt.Errorf("cannot update ListenerSet status %s/%s: namespace is not within watched namespaces", listenerSet.Namespace, listenerSet.Name)
 	}
 
-	service, err := c.factoriesKube[c.lookupNamespace(namespace)].Core().V1().Services().Lister().Services(namespace).Get(name)
-	exist, err := translateNotFoundError(err)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentListenerSet, err := c.factoriesGateway[c.lookupNamespace(listenerSet.Namespace)].Gateway().V1().ListenerSets().Lister().ListenerSets(listenerSet.Namespace).Get(listenerSet.Name)
+		if err != nil {
+			// We have to return err itself here (not wrapped inside another error) so that RetryOnConflict can identify it correctly.
+			return err
+		}
 
-	return service, exist, err
-}
+		if listenerSetStatusEqual(currentListenerSet.Status, status) {
+			return nil
+		}
 
-// GetEndpoints returns the named endpoints from the given namespace.
-func (c *clientWrapper) GetEndpoints(namespace, name string) (*corev1.Endpoints, bool, error) {
-	if !c.isWatchedNamespace(namespace) {
-		return nil, false, fmt.Errorf("failed to get endpoints %s/%s: namespace is not within watched namespaces", namespace, name)
+		currentListenerSet = currentListenerSet.DeepCopy()
+		currentListenerSet.Status = status
+
+		if _, err = c.csGateway.GatewayV1().ListenerSets(listenerSet.Namespace).UpdateStatus(ctx, currentListenerSet, metav1.UpdateOptions{}); err != nil {
+			// We have to return err itself here (not wrapped inside another error) so that RetryOnConflict can identify it correctly.
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update ListenerSet %s/%s status: %w", listenerSet.Namespace, listenerSet.Name, err)
 	}
 
-	endpoint, err := c.factoriesKube[c.lookupNamespace(namespace)].Core().V1().Endpoints().Lister().Endpoints(namespace).Get(name)
-	exist, err := translateNotFoundError(err)
-
-	return endpoint, exist, err
+	return nil
 }
 
-// GetSecret returns the named secret from the given namespace.
-func (c *clientWrapper) GetSecret(namespace, name string) (*corev1.Secret, bool, error) {
-	if !c.isWatchedNamespace(namespace) {
-		return nil, false, fmt.Errorf("failed to get secret %s/%s: namespace is not within watched namespaces", namespace, name)
-	}
-
-	secret, err := c.factoriesSecret[c.lookupNamespace(namespace)].Core().V1().Secrets().Lister().Secrets(namespace).Get(name)
-	exist, err := translateNotFoundError(err)
-
-	return secret, exist, err
-}
-
-// lookupNamespace returns the lookup namespace key for the given namespace.
+// lookupNamespace returns the lookup namespace listenerKey for the given namespace.
 // When listening on all namespaces, it returns the client-go identifier ("")
 // for all-namespaces. Otherwise, it returns the given namespace.
 // The distinction is necessary because we index all informers on the special
 // identifier iff all-namespaces are requested but receive specific namespace
 // identifiers from the Kubernetes API, so we have to bridge this gap.
-func (c *clientWrapper) lookupNamespace(ns string) string {
+func (c *clientWrapper) lookupNamespace(namespace string) string {
 	if c.isNamespaceAll {
 		return metav1.NamespaceAll
 	}
-	return ns
-}
-
-// eventHandlerFunc will pass the obj on to the events channel or drop it.
-// This is so passing the events along won't block in the case of high volume.
-// The events are only used for signaling anyway so dropping a few is ok.
-func eventHandlerFunc(events chan<- interface{}, obj interface{}) {
-	select {
-	case events <- obj:
-	default:
-	}
-}
-
-// translateNotFoundError will translate a "not found" error to a boolean return
-// value which indicates if the resource exists and a nil error.
-func translateNotFoundError(err error) (bool, error) {
-	if kubeerror.IsNotFound(err) {
-		return false, nil
-	}
-	return err == nil, err
+	return namespace
 }
 
 // isWatchedNamespace checks to ensure that the namespace is being watched before we request
 // it to ensure we don't panic by requesting an out-of-watch object.
-func (c *clientWrapper) isWatchedNamespace(ns string) bool {
+func (c *clientWrapper) isWatchedNamespace(namespace string) bool {
 	if c.isNamespaceAll {
 		return true
 	}
-	for _, watchedNamespace := range c.watchedNamespaces {
-		if watchedNamespace == ns {
-			return true
+
+	return slices.Contains(c.watchedNamespaces, namespace)
+}
+
+// mergeRouteParentStatuses returns the desired parentStatuses augmented with the current parentStatuses Traefik does not own.
+func mergeRouteParentStatuses(routeNamespace string, currentParents, desiredParents []gatev1.RouteParentStatus, gateways []gatewayWithListeners) []gatev1.RouteParentStatus {
+	parentStatuses := make([]gatev1.RouteParentStatus, len(desiredParents))
+	copy(parentStatuses, desiredParents)
+
+	for _, currentParent := range currentParents {
+		// Keep statuses added by other gateway controllers.
+		if currentParent.ControllerName != controllerName {
+			parentStatuses = append(parentStatuses, currentParent)
+			continue
+		}
+
+		// TODO: Implement a mechanism to clean up old parentStatus for gateways that no instance manages.
+		// Also, keep statuses from gateways managed by other Traefik instances.
+		// We consider a status managed by the current instance when the parentRef targets one of the managed gateways.
+		// A ListenerSet parentRef is managed when one of the managed gateways loads the listeners of that ListenerSet.
+		// SectionName or Port is not used.
+		owner := listenerOwner{
+			Kind:      string(ptr.Deref(currentParent.ParentRef.Kind, kindGateway)),
+			Namespace: string(ptr.Deref(currentParent.ParentRef.Namespace, gatev1.Namespace(routeNamespace))),
+			Name:      string(currentParent.ParentRef.Name),
+		}
+		if gatewayForOwner(gateways, owner) == nil {
+			parentStatuses = append(parentStatuses, currentParent)
 		}
 	}
-	return false
+
+	return parentStatuses
+}
+
+// gatewayConditionTypes and listenerConditionTypes are the condition types Traefik writes,
+// conditions of any other type are owned by other controllers and must be preserved.
+var (
+	gatewayConditionTypes = []string{
+		string(gatev1.GatewayConditionAccepted),
+		string(gatev1.GatewayConditionProgrammed),
+		string(gatev1.GatewayConditionResolvedRefs),
+		string(gatev1.GatewayConditionInsecureFrontendValidationMode),
+	}
+	listenerConditionTypes = []string{
+		string(gatev1.ListenerConditionAccepted),
+		string(gatev1.ListenerConditionConflicted),
+		string(gatev1.ListenerConditionProgrammed),
+		string(gatev1.ListenerConditionResolvedRefs),
+	}
+)
+
+// withoutForeignConditions returns the status without the Gateway and listener conditions not owned by Traefik.
+func withoutForeignConditions(status gatev1.GatewayStatus) gatev1.GatewayStatus {
+	filtered := status.DeepCopy()
+	filtered.Conditions = slices.DeleteFunc(filtered.Conditions, func(condition metav1.Condition) bool {
+		return !slices.Contains(gatewayConditionTypes, condition.Type)
+	})
+
+	for i := range filtered.Listeners {
+		filtered.Listeners[i].Conditions = slices.DeleteFunc(filtered.Listeners[i].Conditions, func(condition metav1.Condition) bool {
+			return !slices.Contains(listenerConditionTypes, condition.Type)
+		})
+	}
+
+	return *filtered
+}
+
+// mergeGatewayStatus returns the desired status, with the Gateway and listener conditions
+// of the current status that are not owned by Traefik.
+func mergeGatewayStatus(current, desired gatev1.GatewayStatus) gatev1.GatewayStatus {
+	status := desired.DeepCopy()
+	for _, condition := range current.Conditions {
+		if !slices.Contains(gatewayConditionTypes, condition.Type) {
+			status.Conditions = append(status.Conditions, condition)
+		}
+	}
+
+	for i, listener := range status.Listeners {
+		idx := slices.IndexFunc(current.Listeners, func(l gatev1.ListenerStatus) bool {
+			return l.Name == listener.Name
+		})
+		if idx < 0 {
+			continue
+		}
+
+		for _, condition := range current.Listeners[idx].Conditions {
+			if !slices.Contains(listenerConditionTypes, condition.Type) {
+				status.Listeners[i].Conditions = append(status.Listeners[i].Conditions, condition)
+			}
+		}
+	}
+
+	return *status
+}
+
+func gatewayStatusEqual(statusA, statusB gatev1.GatewayStatus) bool {
+	return reflect.DeepEqual(statusA.Addresses, statusB.Addresses) &&
+		reflect.DeepEqual(statusA.AttachedListenerSets, statusB.AttachedListenerSets) &&
+		listenersStatusEqual(statusA.Listeners, statusB.Listeners) &&
+		conditionsEqual(statusA.Conditions, statusB.Conditions)
+}
+
+func policyAncestorStatusesEqual(policyAncestorStatusesA, policyAncestorStatusesB []gatev1.PolicyAncestorStatus) bool {
+	if len(policyAncestorStatusesA) != len(policyAncestorStatusesB) {
+		return false
+	}
+
+	for _, sA := range policyAncestorStatusesA {
+		if !slices.ContainsFunc(policyAncestorStatusesB, func(sB gatev1.PolicyAncestorStatus) bool {
+			return policyAncestorStatusEqual(sB, sA)
+		}) {
+			return false
+		}
+	}
+
+	for _, sB := range policyAncestorStatusesB {
+		if !slices.ContainsFunc(policyAncestorStatusesA, func(sA gatev1.PolicyAncestorStatus) bool {
+			return policyAncestorStatusEqual(sA, sB)
+		}) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func policyAncestorStatusEqual(sA, sB gatev1.PolicyAncestorStatus) bool {
+	return sA.ControllerName == sB.ControllerName &&
+		reflect.DeepEqual(sA.AncestorRef, sB.AncestorRef) &&
+		conditionsEqual(sA.Conditions, sB.Conditions)
+}
+
+func routeParentStatusesEqual(routeParentStatusesA, routeParentStatusesB []gatev1.RouteParentStatus) bool {
+	if len(routeParentStatusesA) != len(routeParentStatusesB) {
+		return false
+	}
+
+	for _, sA := range routeParentStatusesA {
+		if !slices.ContainsFunc(routeParentStatusesB, func(sB gatev1.RouteParentStatus) bool {
+			return routeParentStatusEqual(sB, sA)
+		}) {
+			return false
+		}
+	}
+
+	for _, sB := range routeParentStatusesB {
+		if !slices.ContainsFunc(routeParentStatusesA, func(sA gatev1.RouteParentStatus) bool {
+			return routeParentStatusEqual(sA, sB)
+		}) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func routeParentStatusEqual(sA, sB gatev1.RouteParentStatus) bool {
+	return sA.ControllerName == sB.ControllerName &&
+		reflect.DeepEqual(sA.ParentRef, sB.ParentRef) &&
+		conditionsEqual(sA.Conditions, sB.Conditions)
+}
+
+func listenersStatusEqual(listenerA, listenerB []gatev1.ListenerStatus) bool {
+	return slices.EqualFunc(listenerA, listenerB, func(lA gatev1.ListenerStatus, lB gatev1.ListenerStatus) bool {
+		return lA.Name == lB.Name &&
+			lA.AttachedRoutes == lB.AttachedRoutes &&
+			conditionsEqual(lA.Conditions, lB.Conditions)
+	})
+}
+
+func conditionsEqual(conditionsA, conditionsB []metav1.Condition) bool {
+	return slices.EqualFunc(conditionsA, conditionsB, func(cA metav1.Condition, cB metav1.Condition) bool {
+		return cA.Type == cB.Type &&
+			cA.Reason == cB.Reason &&
+			cA.Status == cB.Status &&
+			cA.Message == cB.Message &&
+			cA.ObservedGeneration == cB.ObservedGeneration
+	})
+}
+
+func listenerSetStatusEqual(statusA, statusB gatev1.ListenerSetStatus) bool {
+	return listenerEntryStatusesEqual(statusA.Listeners, statusB.Listeners) &&
+		conditionsEqual(statusA.Conditions, statusB.Conditions)
+}
+
+func listenerEntryStatusesEqual(listenersA, listenersB []gatev1.ListenerEntryStatus) bool {
+	return slices.EqualFunc(listenersA, listenersB, func(lA gatev1.ListenerEntryStatus, lB gatev1.ListenerEntryStatus) bool {
+		return lA.Name == lB.Name &&
+			lA.AttachedRoutes == lB.AttachedRoutes &&
+			conditionsEqual(lA.Conditions, lB.Conditions)
+	})
+}
+
+// isClusterTrustBundleAPIServed reports whether the cluster serves the ClusterTrustBundle API.
+func (c *clientWrapper) isClusterTrustBundleAPIServed() (bool, error) {
+	resourceList, err := c.csKube.Discovery().ServerResourcesForGroupVersion(certificatesv1.SchemeGroupVersion.String())
+	if err != nil {
+		if kerror.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return slices.ContainsFunc(resourceList.APIResources, func(r metav1.APIResource) bool { return r.Name == "clustertrustbundles" }), nil
+}
+
+// isClusterTrustBundleAllowed reports whether Traefik is allowed to list and watch ClusterTrustBundles.
+func (c *clientWrapper) isClusterTrustBundleAllowed() (bool, error) {
+	for _, verb := range []string{"list", "watch"} {
+		review := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Group:    certificatesv1.GroupName,
+					Resource: "clustertrustbundles",
+					Verb:     verb,
+				},
+			},
+		}
+
+		review, err := c.csKube.AuthorizationV1().SelfSubjectAccessReviews().Create(context.Background(), review, metav1.CreateOptions{})
+		if err != nil {
+			return false, fmt.Errorf("checking %s permission on clustertrustbundles: %w", verb, err)
+		}
+
+		if !review.Status.Allowed {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }

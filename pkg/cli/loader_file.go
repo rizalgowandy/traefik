@@ -4,10 +4,10 @@ import (
 	"os"
 	"strings"
 
+	"github.com/rs/zerolog/log"
 	"github.com/traefik/paerser/cli"
 	"github.com/traefik/paerser/file"
 	"github.com/traefik/paerser/flag"
-	"github.com/traefik/traefik/v2/pkg/log"
 )
 
 // FileLoader loads a configuration from a file.
@@ -52,18 +52,17 @@ func (f *FileLoader) Load(args []string, cmd *cli.Command) (bool, error) {
 		return false, nil
 	}
 
-	logger := log.WithoutContext()
-	logger.Printf("Configuration loaded from file: %s", configFile)
+	log.Printf("Configuration loaded from file: %s", configFile)
 
 	content, _ := os.ReadFile(configFile)
-	logger.Debug(string(content))
+	log.Debug().Str("configFile", configFile).Bytes("content", content).Send()
 
 	return true, nil
 }
 
 // loadConfigFiles tries to decode the given configuration file and all default locations for the configuration file.
 // It stops as soon as decoding one of them is successful.
-func loadConfigFiles(configFile string, element interface{}) (string, error) {
+func loadConfigFiles(configFile string, element any) (string, error) {
 	finder := cli.Finder{
 		BasePaths:  []string{"/etc/traefik/traefik", "$XDG_CONFIG_HOME/traefik", "$HOME/.config/traefik", "./traefik"},
 		Extensions: []string{"toml", "yaml", "yml"},

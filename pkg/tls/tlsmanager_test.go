@@ -2,13 +2,21 @@ package tls
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/traefik/traefik/v3/pkg/types"
+	"golang.org/x/crypto/ocsp"
 )
 
 // LocalhostCert is a PEM-encoded TLS cert with SAN IPs
@@ -16,51 +24,68 @@ import (
 // generated from src/crypto/tls:
 // go run generate_cert.go  --rsa-bits 1024 --host 127.0.0.1,::1,example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
 var (
-	localhostCert = FileOrContent(`-----BEGIN CERTIFICATE-----
-MIICEzCCAXygAwIBAgIQMIMChMLGrR+QvmQvpwAU6zANBgkqhkiG9w0BAQsFADAS
+	localhostCert = types.FileOrContent(`-----BEGIN CERTIFICATE-----
+MIIDOTCCAiGgAwIBAgIQSRJrEpBGFc7tNb1fb5pKFzANBgkqhkiG9w0BAQsFADAS
 MRAwDgYDVQQKEwdBY21lIENvMCAXDTcwMDEwMTAwMDAwMFoYDzIwODQwMTI5MTYw
-MDAwWjASMRAwDgYDVQQKEwdBY21lIENvMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCB
-iQKBgQDuLnQAI3mDgey3VBzWnB2L39JUU4txjeVE6myuDqkM/uGlfjb9SjY1bIw4
-iA5sBBZzHi3z0h1YV8QPuxEbi4nW91IJm2gsvvZhIrCHS3l6afab4pZBl2+XsDul
-rKBxKKtD1rGxlG4LjncdabFn9gvLZad2bSysqz/qTAUStTvqJQIDAQABo2gwZjAO
-BgNVHQ8BAf8EBAMCAqQwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDwYDVR0TAQH/BAUw
-AwEB/zAuBgNVHREEJzAlggtleGFtcGxlLmNvbYcEfwAAAYcQAAAAAAAAAAAAAAAA
-AAAAATANBgkqhkiG9w0BAQsFAAOBgQCEcetwO59EWk7WiJsG4x8SY+UIAA+flUI9
-tyC4lNhbcF2Idq9greZwbYCqTTTr2XiRNSMLCOjKyI7ukPoPjo16ocHj+P3vZGfs
-h1fIw3cSS2OolhloGw/XM6RWPWtPAlGykKLciQrBru5NAPvCMsb/I1DAceTiotQM
-fblo6RBxUQ==
+MDAwWjASMRAwDgYDVQQKEwdBY21lIENvMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
+MIIBCgKCAQEA6Gba5tHV1dAKouAaXO3/ebDUU4rvwCUg/CNaJ2PT5xLD4N1Vcb8r
+bFSW2HXKq+MPfVdwIKR/1DczEoAGf/JWQTW7EgzlXrCd3rlajEX2D73faWJekD0U
+aUgz5vtrTXZ90BQL7WvRICd7FlEZ6FPOcPlumiyNmzUqtwGhO+9ad1W5BqJaRI6P
+YfouNkwR6Na4TzSj5BrqUfP0FwDizKSJ0XXmh8g8G9mtwxOSN3Ru1QFc61Xyeluk
+POGKBV/q6RBNklTNe0gI8usUMlYyoC7ytppNMW7X2vodAelSu25jgx2anj9fDVZu
+h7AXF5+4nJS4AAt0n1lNY7nGSsdZas8PbQIDAQABo4GIMIGFMA4GA1UdDwEB/wQE
+AwICpDATBgNVHSUEDDAKBggrBgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MB0GA1Ud
+DgQWBBStsdjh3/JCXXYlQryOrL4Sh7BW5TAuBgNVHREEJzAlggtleGFtcGxlLmNv
+bYcEfwAAAYcQAAAAAAAAAAAAAAAAAAAAATANBgkqhkiG9w0BAQsFAAOCAQEAxWGI
+5NhpF3nwwy/4yB4i/CwwSpLrWUa70NyhvprUBC50PxiXav1TeDzwzLx/o5HyNwsv
+cxv3HdkLW59i/0SlJSrNnWdfZ19oTcS+6PtLoVyISgtyN6DpkKpdG1cOkW3Cy2P2
++tK/tKHRP1Y/Ra0RiDpOAmqn0gCOFGz8+lqDIor/T7MTpibL3IxqWfPrvfVRHL3B
+grw/ZQTTIVjjh4JBSW3WyWgNo/ikC1lrVxzl4iPUGptxT36Cr7Zk2Bsg0XqwbOvK
+5d+NTDREkSnUbie4GeutujmX3Dsx88UiV6UY/4lHJa6I5leHUNOHahRbpbWeOfs/
+WkBKOclmOV2xlTVuPw==
 -----END CERTIFICATE-----`)
 
 	// LocalhostKey is the private key for localhostCert.
-	localhostKey = FileOrContent(`-----BEGIN RSA PRIVATE KEY-----
-MIICXgIBAAKBgQDuLnQAI3mDgey3VBzWnB2L39JUU4txjeVE6myuDqkM/uGlfjb9
-SjY1bIw4iA5sBBZzHi3z0h1YV8QPuxEbi4nW91IJm2gsvvZhIrCHS3l6afab4pZB
-l2+XsDulrKBxKKtD1rGxlG4LjncdabFn9gvLZad2bSysqz/qTAUStTvqJQIDAQAB
-AoGAGRzwwir7XvBOAy5tM/uV6e+Zf6anZzus1s1Y1ClbjbE6HXbnWWF/wbZGOpet
-3Zm4vD6MXc7jpTLryzTQIvVdfQbRc6+MUVeLKwZatTXtdZrhu+Jk7hx0nTPy8Jcb
-uJqFk541aEw+mMogY/xEcfbWd6IOkp+4xqjlFLBEDytgbIECQQDvH/E6nk+hgN4H
-qzzVtxxr397vWrjrIgPbJpQvBsafG7b0dA4AFjwVbFLmQcj2PprIMmPcQrooz8vp
-jy4SHEg1AkEA/v13/5M47K9vCxmb8QeD/asydfsgS5TeuNi8DoUBEmiSJwma7FXY
-fFUtxuvL7XvjwjN5B30pNEbc6Iuyt7y4MQJBAIt21su4b3sjXNueLKH85Q+phy2U
-fQtuUE9txblTu14q3N7gHRZB4ZMhFYyDy8CKrN2cPg/Fvyt0Xlp/DoCzjA0CQQDU
-y2ptGsuSmgUtWj3NM9xuwYPm+Z/F84K6+ARYiZ6PYj013sovGKUFfYAqVXVlxtIX
-qyUBnu3X9ps8ZfjLZO7BAkEAlT4R5Yl6cGhaJQYZHOde3JEMhNRcVFMO8dJDaFeo
-f9Oeos0UUothgiDktdQHxdNEwLjQf7lJJBzV+5OtwswCWA==
+	localhostKey = types.FileOrContent(`-----BEGIN RSA PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDoZtrm0dXV0Aqi
+4Bpc7f95sNRTiu/AJSD8I1onY9PnEsPg3VVxvytsVJbYdcqr4w99V3AgpH/UNzMS
+gAZ/8lZBNbsSDOVesJ3euVqMRfYPvd9pYl6QPRRpSDPm+2tNdn3QFAvta9EgJ3sW
+URnoU85w+W6aLI2bNSq3AaE771p3VbkGolpEjo9h+i42TBHo1rhPNKPkGupR8/QX
+AOLMpInRdeaHyDwb2a3DE5I3dG7VAVzrVfJ6W6Q84YoFX+rpEE2SVM17SAjy6xQy
+VjKgLvK2mk0xbtfa+h0B6VK7bmODHZqeP18NVm6HsBcXn7iclLgAC3SfWU1jucZK
+x1lqzw9tAgMBAAECggEABWzxS1Y2wckblnXY57Z+sl6YdmLV+gxj2r8Qib7g4ZIk
+lIlWR1OJNfw7kU4eryib4fc6nOh6O4AWZyYqAK6tqNQSS/eVG0LQTLTTEldHyVJL
+dvBe+MsUQOj4nTndZW+QvFzbcm2D8lY5n2nBSxU5ypVoKZ1EqQzytFcLZpTN7d89
+EPj0qDyrV4NZlWAwL1AygCwnlwhMQjXEalVF1ylXwU3QzyZ/6MgvF6d3SSUlh+sq
+XefuyigXw484cQQgbzopv6niMOmGP3of+yV4JQqUSb3IDmmT68XjGd2Dkxl4iPki
+6ZwXf3CCi+c+i/zVEcufgZ3SLf8D99kUGE7v7fZ6AQKBgQD1ZX3RAla9hIhxCf+O
+3D+I1j2LMrdjAh0ZKKqwMR4JnHX3mjQI6LwqIctPWTU8wYFECSh9klEclSdCa64s
+uI/GNpcqPXejd0cAAdqHEEeG5sHMDt0oFSurL4lyud0GtZvwlzLuwEweuDtvT9cJ
+Wfvl86uyO36IW8JdvUprYDctrQKBgQDycZ697qutBieZlGkHpnYWUAeImVA878sJ
+w44NuXHvMxBPz+lbJGAg8Cn8fcxNAPqHIraK+kx3po8cZGQywKHUWsxi23ozHoxo
++bGqeQb9U661TnfdDspIXia+xilZt3mm5BPzOUuRqlh4Y9SOBpSWRmEhyw76w4ZP
+OPxjWYAgwQKBgA/FehSYxeJgRjSdo+MWnK66tjHgDJE8bYpUZsP0JC4R9DL5oiaA
+brd2fI6Y+SbyeNBallObt8LSgzdtnEAbjIH8uDJqyOmknNePRvAvR6mP4xyuR+Bv
+m+Lgp0DMWTw5J9CKpydZDItc49T/mJ5tPhdFVd+am0NAQnmr1MCZ6nHxAoGABS3Y
+LkaC9FdFUUqSU8+Chkd/YbOkuyiENdkvl6t2e52jo5DVc1T7mLiIrRQi4SI8N9bN
+/3oJWCT+uaSLX2ouCtNFunblzWHBrhxnZzTeqVq4SLc8aESAnbslKL4i8/+vYZlN
+s8xtiNcSvL+lMsOBORSXzpj/4Ot8WwTkn1qyGgECgYBKNTypzAHeLE6yVadFp3nQ
+Ckq9yzvP/ib05rvgbvrne00YeOxqJ9gtTrzgh7koqJyX1L4NwdkEza4ilDWpucn0
+xiUZS4SoaJq6ZvcBYS62Yr1t8n09iG47YL8ibgtmH3L+svaotvpVxVK+d7BLevA/
+ZboOWVe3icTy64BT3OQhmg==
 -----END RSA PRIVATE KEY-----`)
 )
 
 func TestTLSInStore(t *testing.T) {
 	dynamicConfigs := []*CertAndStores{{
-		Certificate: Certificate{
-			CertFile: localhostCert,
-			KeyFile:  localhostKey,
-		},
+		CertFile: localhostCert,
+		KeyFile:  localhostKey,
 	}}
 
-	tlsManager := NewManager()
-	tlsManager.UpdateConfigs(context.Background(), nil, nil, dynamicConfigs)
+	tlsManager := NewManager(nil)
+	tlsManager.UpdateConfigs(t.Context(), nil, nil, dynamicConfigs)
 
-	certs := tlsManager.GetStore("default").DynamicCerts.Get().(map[string]*tls.Certificate)
+	certs := tlsManager.GetStore("default").DynamicCerts.Get().(map[string]*CertificateData)
 	if len(certs) == 0 {
 		t.Fatal("got error: default store must have TLS certificates.")
 	}
@@ -68,14 +93,12 @@ func TestTLSInStore(t *testing.T) {
 
 func TestTLSInvalidStore(t *testing.T) {
 	dynamicConfigs := []*CertAndStores{{
-		Certificate: Certificate{
-			CertFile: localhostCert,
-			KeyFile:  localhostKey,
-		},
+		CertFile: localhostCert,
+		KeyFile:  localhostKey,
 	}}
 
-	tlsManager := NewManager()
-	tlsManager.UpdateConfigs(context.Background(),
+	tlsManager := NewManager(nil)
+	tlsManager.UpdateConfigs(t.Context(),
 		map[string]Store{
 			"default": {
 				DefaultCertificate: &Certificate{
@@ -85,7 +108,7 @@ func TestTLSInvalidStore(t *testing.T) {
 			},
 		}, nil, dynamicConfigs)
 
-	certs := tlsManager.GetStore("default").DynamicCerts.Get().(map[string]*tls.Certificate)
+	certs := tlsManager.GetStore("default").DynamicCerts.Get().(map[string]*CertificateData)
 	if len(certs) == 0 {
 		t.Fatal("got error: default store must have TLS certificates.")
 	}
@@ -93,15 +116,14 @@ func TestTLSInvalidStore(t *testing.T) {
 
 func TestManager_Get(t *testing.T) {
 	dynamicConfigs := []*CertAndStores{{
-		Certificate: Certificate{
-			CertFile: localhostCert,
-			KeyFile:  localhostKey,
-		},
+		CertFile: localhostCert,
+		KeyFile:  localhostKey,
 	}}
 
 	tlsConfigs := map[string]Options{
-		"foo": {MinVersion: "VersionTLS12"},
-		"bar": {MinVersion: "VersionTLS11"},
+		"foo":     {MinVersion: "VersionTLS12"},
+		"bar":     {MinVersion: "VersionTLS11"},
+		"invalid": {CurvePreferences: []string{"42"}},
 	}
 
 	testCases := []struct {
@@ -121,33 +143,38 @@ func TestManager_Get(t *testing.T) {
 			expectedMinVersion: uint16(tls.VersionTLS11),
 		},
 		{
-			desc:           "Get an tls config from an invalid name",
+			desc:           "Get a tls config from an invalid name",
 			tlsOptionsName: "unknown",
 			expectedError:  true,
 		},
 		{
-			desc:           "Get an tls config from unexisting 'default' name",
+			desc:           "Get a tls config from unexisting 'default' name",
 			tlsOptionsName: "default",
+			expectedError:  true,
+		},
+		{
+			desc:           "Get an invalid tls config",
+			tlsOptionsName: "invalid",
 			expectedError:  true,
 		},
 	}
 
-	tlsManager := NewManager()
-	tlsManager.UpdateConfigs(context.Background(), nil, tlsConfigs, dynamicConfigs)
+	tlsManager := NewManager(nil)
+	tlsManager.UpdateConfigs(t.Context(), nil, tlsConfigs, dynamicConfigs)
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			config, err := tlsManager.Get("default", test.tlsOptionsName)
 			if test.expectedError {
-				assert.Error(t, err)
+				require.Nil(t, config)
+				require.Error(t, err)
 				return
 			}
 
-			assert.NoError(t, err)
-			assert.Equal(t, config.MinVersion, test.expectedMinVersion)
+			require.NoError(t, err)
+			assert.Equal(t, test.expectedMinVersion, config.MinVersion)
 		})
 	}
 }
@@ -171,7 +198,7 @@ func TestClientAuth(t *testing.T) {
 		},
 		"vccig": {
 			ClientAuth: ClientAuth{
-				CAFiles:        []FileOrContent{localhostCert},
+				CAFiles:        []types.FileOrContent{localhostCert},
 				ClientAuthType: "VerifyClientCertIfGiven",
 			},
 		},
@@ -183,13 +210,13 @@ func TestClientAuth(t *testing.T) {
 		},
 		"ravccwca": {
 			ClientAuth: ClientAuth{
-				CAFiles:        []FileOrContent{localhostCert},
+				CAFiles:        []types.FileOrContent{localhostCert},
 				ClientAuthType: "RequireAndVerifyClientCert",
 			},
 		},
 		"ravccwbca": {
 			ClientAuth: ClientAuth{
-				CAFiles:        []FileOrContent{"Bad content"},
+				CAFiles:        []types.FileOrContent{"Bad content"},
 				ClientAuthType: "RequireAndVerifyClientCert",
 			},
 		},
@@ -271,11 +298,10 @@ func TestClientAuth(t *testing.T) {
 		},
 	}
 
-	tlsManager := NewManager()
-	tlsManager.UpdateConfigs(context.Background(), nil, tlsConfigs, nil)
+	tlsManager := NewManager(nil)
+	tlsManager.UpdateConfigs(t.Context(), nil, tlsConfigs, nil)
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -291,10 +317,133 @@ func TestClientAuth(t *testing.T) {
 			if test.expectedRawSubject != nil {
 				subjects := config.ClientCAs.Subjects()
 				assert.Len(t, subjects, 1)
-				assert.Equal(t, subjects[0], test.expectedRawSubject)
+				assert.Equal(t, test.expectedRawSubject, subjects[0])
 			}
 
-			assert.Equal(t, config.ClientAuth, test.expectedClientAuth)
+			assert.Equal(t, test.expectedClientAuth, config.ClientAuth)
 		})
 	}
+}
+
+func TestManager_UpdateConfigs_OCSPConfig(t *testing.T) {
+	leafCert, err := tls.X509KeyPair([]byte(certWithOCSPServer), []byte(certKey))
+	require.NoError(t, err)
+
+	issuerCert, err := tls.X509KeyPair([]byte(caCert), []byte(caKey))
+	require.NoError(t, err)
+
+	thisUpdate, err := time.Parse("2006-01-02", "2025-01-01")
+	require.NoError(t, err)
+	nextUpdate, err := time.Parse("2006-01-02", "2025-01-02")
+	require.NoError(t, err)
+
+	ocspResponseTmpl := ocsp.Response{
+		SerialNumber:    leafCert.Leaf.SerialNumber,
+		TBSResponseData: []byte("foo"),
+		ThisUpdate:      thisUpdate,
+		NextUpdate:      nextUpdate,
+	}
+
+	ocspResponse, err := ocsp.CreateResponse(leafCert.Leaf, leafCert.Leaf, ocspResponseTmpl, issuerCert.PrivateKey.(crypto.Signer))
+	require.NoError(t, err)
+
+	responderCall := make(chan struct{})
+
+	handler := func(rw http.ResponseWriter, req *http.Request) {
+		ct := req.Header.Get("Content-Type")
+		assert.Equal(t, "application/ocsp-request", ct)
+
+		reqBytes, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+
+		_, err = ocsp.ParseRequest(reqBytes)
+		require.NoError(t, err)
+
+		rw.Header().Set("Content-Type", "application/ocsp-response")
+
+		_, err = rw.Write(ocspResponse)
+		require.NoError(t, err)
+
+		responderCall <- struct{}{}
+	}
+
+	responder := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(responder.Close)
+
+	testContext, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	tlsManager := NewManager(&OCSPConfig{
+		ResponderOverrides: map[string]string{
+			"ocsp.example.com": responder.URL,
+		},
+	})
+
+	go tlsManager.Run(testContext)
+
+	tlsManager.ocspStapler.cache.Set("existing", &ocspEntry{
+		leaf:       leafCert.Leaf,
+		issuer:     issuerCert.Leaf,
+		staple:     []byte("foo"),
+		nextUpdate: time.Now().Add(time.Hour),
+	}, cache.NoExpiration)
+	tlsManager.ocspStapler.cache.Set("existingWithTTL", &ocspEntry{
+		leaf:       leafCert.Leaf,
+		issuer:     issuerCert.Leaf,
+		staple:     []byte("foo"),
+		nextUpdate: time.Now().Add(time.Hour),
+	}, 2*defaultCacheDuration)
+
+	tlsManager.UpdateConfigs(testContext, nil, nil, []*CertAndStores{
+		{
+			CertFile: certWithOCSPServer,
+			KeyFile:  certKey,
+		},
+	})
+
+	// Asserting that UpdateConfigs resets the expiration for existing entries.
+	_, expiration, ok := tlsManager.ocspStapler.cache.GetWithExpiration("existing")
+	require.True(t, ok)
+	assert.Greater(t, expiration, time.Now())
+	// But not for entries with TTL already set.
+	_, expiration, ok = tlsManager.ocspStapler.cache.GetWithExpiration("existingWithTTL")
+	require.True(t, ok)
+	assert.Greater(t, expiration, time.Now().Add(defaultCacheDuration))
+
+	select {
+	case <-responderCall:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timeout waiting for OCSP responder call")
+	}
+
+	assert.Len(t, tlsManager.ocspStapler.cache.Items(), 3)
+
+	certHash := hashRawCert(leafCert.Leaf.Raw)
+	_, ok = tlsManager.ocspStapler.cache.Get(certHash)
+	require.True(t, ok)
+}
+
+func TestManager_Get_DefaultValues(t *testing.T) {
+	tlsManager := NewManager(nil)
+
+	// Ensures we won't break things for Traefik users when updating Go
+	config, _ := tlsManager.Get("default", "default")
+	assert.Equal(t, uint16(tls.VersionTLS12), config.MinVersion)
+	assert.Equal(t, []string{"h2", "http/1.1", "acme-tls/1"}, config.NextProtos)
+	assert.False(t, config.SessionTicketsDisabled)
+	assert.Equal(t, []uint16{
+		tls.TLS_AES_128_GCM_SHA256,
+		tls.TLS_AES_256_GCM_SHA384,
+		tls.TLS_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	}, config.CipherSuites)
 }

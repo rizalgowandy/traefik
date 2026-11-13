@@ -4,20 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 
 	"github.com/gorilla/mux"
-	"github.com/traefik/traefik/v2/pkg/config/static"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/static"
 )
 
 type entryPointRepresentation struct {
 	*static.EntryPoint
+
 	Name string `json:"name,omitempty"`
 }
 
-func (h Handler) getEntryPoints(rw http.ResponseWriter, request *http.Request) {
+func (h *Handler) getEntryPoints(rw http.ResponseWriter, request *http.Request) {
 	results := make([]entryPointRepresentation, 0, len(h.staticConfig.EntryPoints))
 
 	for name, ep := range h.staticConfig.EntryPoints {
@@ -43,13 +45,19 @@ func (h Handler) getEntryPoints(rw http.ResponseWriter, request *http.Request) {
 
 	err = json.NewEncoder(rw).Encode(results[pageInfo.startIndex:pageInfo.endIndex])
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getEntryPoint(rw http.ResponseWriter, request *http.Request) {
-	entryPointID := mux.Vars(request)["entryPointID"]
+func (h *Handler) getEntryPoint(rw http.ResponseWriter, request *http.Request) {
+	scapedEntryPointID := mux.Vars(request)["entryPointID"]
+
+	entryPointID, err := url.PathUnescape(scapedEntryPointID)
+	if err != nil {
+		writeError(rw, fmt.Sprintf("unable to decode entryPointID %q: %s", scapedEntryPointID, err), http.StatusBadRequest)
+		return
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -64,9 +72,9 @@ func (h Handler) getEntryPoint(rw http.ResponseWriter, request *http.Request) {
 		Name:       entryPointID,
 	}
 
-	err := json.NewEncoder(rw).Encode(result)
+	err = json.NewEncoder(rw).Encode(result)
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }

@@ -2,22 +2,20 @@ package auth
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 
 	goauth "github.com/abbot/go-http-auth"
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/middlewares"
-	"github.com/traefik/traefik/v2/pkg/middlewares/accesslog"
-	"github.com/traefik/traefik/v2/pkg/tracing"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares"
+	"github.com/traefik/traefik/v3/pkg/middlewares/accesslog"
+	"github.com/traefik/traefik/v3/pkg/middlewares/observability"
 )
 
 const (
-	digestTypeName = "digestAuth"
+	typeNameDigest = "digestAuth"
 )
 
 type digestAuth struct {
@@ -31,7 +29,8 @@ type digestAuth struct {
 
 // NewDigest creates a digest auth middleware.
 func NewDigest(ctx context.Context, next http.Handler, authConfig dynamic.DigestAuth, name string) (http.Handler, error) {
-	log.FromContext(middlewares.GetLoggerCtx(ctx, name, digestTypeName)).Debug("Creating middleware")
+	middlewares.GetLogger(ctx, name, typeNameDigest).Debug().Msg("Creating middleware")
+
 	users, err := getUsers(authConfig.UsersFile, authConfig.Users, digestUserParser)
 	if err != nil {
 		return nil, err
@@ -54,12 +53,12 @@ func NewDigest(ctx context.Context, next http.Handler, authConfig dynamic.Digest
 	return da, nil
 }
 
-func (d *digestAuth) GetTracingInformation() (string, ext.SpanKindEnum) {
-	return d.name, tracing.SpanKindNoneEnum
+func (d *digestAuth) GetTracingInformation() (string, string) {
+	return d.name, typeNameDigest
 }
 
 func (d *digestAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	logger := log.FromContext(middlewares.GetLoggerCtx(req.Context(), d.name, digestTypeName))
+	logger := middlewares.GetLogger(req.Context(), d.name, typeNameDigest)
 
 	username, authinfo := d.auth.CheckAuth(req)
 	if username == "" {
@@ -77,19 +76,19 @@ func (d *digestAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 
 		if authinfo != nil && *authinfo == "stale" {
-			logger.Debug("Digest authentication failed, possibly because out of order requests")
-			tracing.SetErrorWithEvent(req, "Digest authentication failed, possibly because out of order requests")
+			logger.Debug().Msg("Digest authentication failed, possibly because out of order requests")
+			observability.SetStatusErrorf(req.Context(), "Digest authentication failed, possibly because out of order requests")
 			d.auth.RequireAuthStale(rw, req)
 			return
 		}
 
-		logger.Debug("Digest authentication failed")
-		tracing.SetErrorWithEvent(req, "Digest authentication failed")
+		logger.Debug().Msg("Digest authentication failed")
+		observability.SetStatusErrorf(req.Context(), "Digest authentication failed")
 		d.auth.RequireAuth(rw, req)
 		return
 	}
 
-	logger.Debug("Digest authentication succeeded")
+	logger.Debug().Msg("Digest authentication succeeded")
 	req.URL.User = url.User(username)
 
 	logData := accesslog.GetLogData(req)
@@ -98,11 +97,15 @@ func (d *digestAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if d.headerField != "" {
+		// Note: the header names aliasing the header field (e.g. X_Auth_User) are not handled here,
+		// as the aliasHeadersStrategy entry point option is expected to be enabled to prevent header spoofing.
+		// TODO Deprecated we should add the header with canonical key.
+		req.Header.Del(d.headerField)
 		req.Header[d.headerField] = []string{username}
 	}
 
 	if d.removeHeader {
-		logger.Debug("Removing the Authorization header")
+		logger.Debug().Msg("Removing the Authorization header")
 		req.Header.Del(authorizationHeader)
 	}
 	d.next.ServeHTTP(rw, req)
@@ -119,7 +122,8 @@ func (d *digestAuth) secretDigest(user, realm string) string {
 func digestUserParser(user string) (string, string, error) {
 	split := strings.Split(user, ":")
 	if len(split) != 3 {
-		return "", "", fmt.Errorf("error parsing DigestUser: %v", user)
+		// The user is not part of the error, as it may come from a secret.
+		return "", "", errors.New("expected user:realm:hash format")
 	}
 	return split[0] + ":" + split[1], split[2], nil
 }

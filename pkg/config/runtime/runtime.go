@@ -4,8 +4,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/observability/logs"
 )
 
 // Status of the router/service.
@@ -15,13 +16,20 @@ const (
 	StatusWarning  = "warning"
 )
 
+// Status of the servers.
+const (
+	StatusUp   = "UP"
+	StatusDown = "DOWN"
+)
+
 // Configuration holds the information about the currently running traefik instance.
 type Configuration struct {
 	Routers        map[string]*RouterInfo        `json:"routers,omitempty"`
 	Middlewares    map[string]*MiddlewareInfo    `json:"middlewares,omitempty"`
-	TCPMiddlewares map[string]*TCPMiddlewareInfo `json:"tcpMiddlewares,omitempty"`
 	Services       map[string]*ServiceInfo       `json:"services,omitempty"`
+	Models         map[string]*dynamic.Model     `json:"-"`
 	TCPRouters     map[string]*TCPRouterInfo     `json:"tcpRouters,omitempty"`
+	TCPMiddlewares map[string]*TCPMiddlewareInfo `json:"tcpMiddlewares,omitempty"`
 	TCPServices    map[string]*TCPServiceInfo    `json:"tcpServices,omitempty"`
 	UDPRouters     map[string]*UDPRouterInfo     `json:"udpRouters,omitempty"`
 	UDPServices    map[string]*UDPServiceInfo    `json:"udpServices,omitempty"`
@@ -59,6 +67,8 @@ func NewConfig(conf dynamic.Configuration) *Configuration {
 				runtimeConfig.Middlewares[k] = &MiddlewareInfo{Middleware: v, Status: StatusEnabled}
 			}
 		}
+
+		runtimeConfig.Models = conf.HTTP.Models
 	}
 
 	if conf.TCP != nil {
@@ -110,8 +120,6 @@ func (c *Configuration) PopulateUsedBy() {
 		return
 	}
 
-	logger := log.WithoutContext()
-
 	for routerName, routerInfo := range c.Routers {
 		// lazily initialize Status in case caller forgot to do it
 		if routerInfo.Status == "" {
@@ -120,7 +128,7 @@ func (c *Configuration) PopulateUsedBy() {
 
 		providerName := getProviderName(routerName)
 		if providerName == "" {
-			logger.WithField(log.RouterName, routerName).Error("router name is not fully qualified")
+			log.Error().Str(logs.RouterName, routerName).Msg("Router name is not fully qualified")
 			continue
 		}
 
@@ -165,7 +173,7 @@ func (c *Configuration) PopulateUsedBy() {
 
 		providerName := getProviderName(routerName)
 		if providerName == "" {
-			logger.WithField(log.RouterName, routerName).Error("tcp router name is not fully qualified")
+			log.Error().Str(logs.RouterName, routerName).Msg("TCP router name is not fully qualified")
 			continue
 		}
 
@@ -202,7 +210,7 @@ func (c *Configuration) PopulateUsedBy() {
 
 		providerName := getProviderName(routerName)
 		if providerName == "" {
-			logger.WithField(log.RouterName, routerName).Error("udp router name is not fully qualified")
+			log.Error().Str(logs.RouterName, routerName).Msg("UDP router name is not fully qualified")
 			continue
 		}
 
@@ -221,15 +229,6 @@ func (c *Configuration) PopulateUsedBy() {
 
 		sort.Strings(c.UDPServices[k].UsedBy)
 	}
-}
-
-func contains(entryPoints []string, entryPointName string) bool {
-	for _, name := range entryPoints {
-		if name == entryPointName {
-			return true
-		}
-	}
-	return false
 }
 
 func getProviderName(elementName string) string {

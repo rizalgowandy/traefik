@@ -1,11 +1,10 @@
 package runtime
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 )
 
 func TestGetUDPRoutersByEntryPoints(t *testing.T) {
@@ -169,7 +168,6 @@ func TestGetUDPRoutersByEntryPoints(t *testing.T) {
 				"webs": {
 					"bar": {
 						UDPRouter: &dynamic.UDPRouter{
-
 							EntryPoints: []string{"webs"},
 							Service:     "bar-service@myprovider",
 						},
@@ -190,11 +188,10 @@ func TestGetUDPRoutersByEntryPoints(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 			runtimeConfig := NewConfig(test.conf)
-			actual := runtimeConfig.GetUDPRoutersByEntryPoints(context.Background(), test.entryPoints)
+			actual := runtimeConfig.GetUDPRoutersByEntryPoints(t.Context(), test.entryPoints)
 			assert.Equal(t, test.expected, actual)
 		})
 	}

@@ -21,6 +21,28 @@
 #
 --certificatesresolvers.myresolver.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
 
+# The certificates' duration in hours.
+# It defaults to 2160 (90 days) to follow Let's Encrypt certificates' duration.
+#
+# Optional
+# Default: 2160
+#
+--certificatesresolvers.myresolver.acme.certificatesDuration=2160
+
+# Timeout for a complete HTTP transaction with the ACME server.
+#
+# Optional
+# Default: 2m
+#
+--certificatesresolvers.myresolver.acme.clientTimeout=2m
+
+# Timeout for receiving the response headers when communicating with the ACME server.
+#
+# Optional
+# Default: 30s
+#
+--certificatesresolvers.myresolver.acme.clientResponseHeaderTimeout=30s
+
 # Preferred chain to use.
 #
 # If the CA offers multiple certificate chains, prefer the chain with an issuer matching this Subject Common Name.
@@ -39,6 +61,13 @@
 # Available values : "EC256", "EC384", "RSA2048", "RSA4096", "RSA8192"
 #
 --certificatesresolvers.myresolver.acme.keytype=RSA4096
+
+# Reuse the private key from the previous certificate generation during the renewal.
+#
+# Optional
+# Default: true
+#
+--certificatesresolvers.myresolver.acme.reuseprivatekey=false
 
 # Use a TLS-ALPN-01 ACME challenge.
 #

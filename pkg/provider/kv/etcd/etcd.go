@@ -1,16 +1,30 @@
 package etcd
 
 import (
-	"github.com/abronan/valkeyrie/store"
-	"github.com/traefik/traefik/v2/pkg/provider"
-	"github.com/traefik/traefik/v2/pkg/provider/kv"
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/kvtools/etcdv3"
+	ptypes "github.com/traefik/paerser/types"
+	"github.com/traefik/traefik/v3/pkg/provider"
+	"github.com/traefik/traefik/v3/pkg/provider/kv"
+	"github.com/traefik/traefik/v3/pkg/types"
 )
+
+// ProviderName is the Etcd provider name.
+const ProviderName = "etcd"
 
 var _ provider.Provider = (*Provider)(nil)
 
 // Provider holds configurations of the provider.
 type Provider struct {
-	kv.Provider `export:"true"`
+	kv.Provider `yaml:",inline" export:"true"`
+
+	TLS        *types.ClientTLS `description:"Enable TLS support." json:"tls,omitempty" toml:"tls,omitempty" yaml:"tls,omitempty" export:"true"`
+	Username   string           `description:"Username for authentication." json:"username,omitempty" toml:"username,omitempty" yaml:"username,omitempty" loggable:"false"`
+	Password   string           `description:"Password for authentication." json:"password,omitempty" toml:"password,omitempty" yaml:"password,omitempty" loggable:"false"`
+	SyncPeriod ptypes.Duration  `description:"Interval at which the client updates its list of endpoints from the etcd cluster membership. A value of 0 disables this auto-sync." json:"syncPeriod,omitempty" toml:"syncPeriod,omitempty" yaml:"syncPeriod,omitempty" export:"true"`
 }
 
 // SetDefaults sets the default values.
@@ -21,5 +35,20 @@ func (p *Provider) SetDefaults() {
 
 // Init the provider.
 func (p *Provider) Init() error {
-	return p.Provider.Init(store.ETCDV3, "etcd")
+	config := &etcdv3.Config{
+		ConnectionTimeout: 3 * time.Second,
+		Username:          p.Username,
+		Password:          p.Password,
+		SyncPeriod:        time.Duration(p.SyncPeriod),
+	}
+
+	if p.TLS != nil {
+		var err error
+		config.TLS, err = p.TLS.CreateTLSConfig(context.Background())
+		if err != nil {
+			return fmt.Errorf("unable to create client TLS configuration: %w", err)
+		}
+	}
+
+	return p.Provider.Init(etcdv3.StoreName, ProviderName, config)
 }

@@ -75,6 +75,45 @@ const (
 	TLSVersion = "TLSVersion"
 	// TLSCipher is the cipher used in the request.
 	TLSCipher = "TLSCipher"
+	// TLSClientSubject is the string representation of the TLS client certificate's Subject.
+	TLSClientSubject = "TLSClientSubject"
+
+	// Deprecated: TraceID is the consistent identifier for tracking requests across services, including upstream ones managed by Traefik, shown as a 32-hex digit string.
+	TraceID = "TraceId"
+	// Deprecated: SpanID is the unique identifier for Traefik’s root span (EntryPoint) within a request trace, formatted as a 16-hex digit string.
+	SpanID = "SpanId"
+
+	// OTelTraceID is the OTel-conformant log attribute for the trace identifier.
+	OTelTraceID = "trace_id"
+	// OTelSpanID is the OTel-conformant log attribute for the span identifier.
+	OTelSpanID = "span_id"
+
+	// Kubernetes Ingress fields.
+
+	// KubernetesIngressNamespace is the namespace of the Kubernetes Ingress resource the router handles.
+	KubernetesIngressNamespace = "KubernetesIngressNamespace"
+	// KubernetesIngressName is the name of the Kubernetes Ingress resource the router handles.
+	KubernetesIngressName = "KubernetesIngressName"
+
+	// Kubernetes Service fields.
+
+	// KubernetesServiceNamespace is the namespace of the Kubernetes Service that handled the request.
+	// Stamped per request from the leaf load balancer, so it reflects the actual backend chosen
+	// by the load balancing strategy under multi-service routes or TraefikService fan-out.
+	KubernetesServiceNamespace = "KubernetesServiceNamespace"
+	// KubernetesServiceName is the name of the Kubernetes Service that handled the request.
+	// See KubernetesServiceNamespace for the per-request semantics.
+	KubernetesServiceName = "KubernetesServiceName"
+	// KubernetesServicePort is the port of the Kubernetes Service that handled the request.
+	// See KubernetesServiceNamespace for the per-request semantics.
+	KubernetesServicePort = "KubernetesServicePort"
+
+	// Kubernetes IngressRoute fields.
+
+	// KubernetesIngressRouteNamespace is the namespace of the Kubernetes IngressRoute CRD the router handles.
+	KubernetesIngressRouteNamespace = "KubernetesIngressRouteNamespace"
+	// KubernetesIngressRouteName is the name of the Kubernetes IngressRoute CRD the router handles.
+	KubernetesIngressRouteName = "KubernetesIngressRouteName"
 )
 
 // These are written out in the default case when no config is provided to specify keys of interest.
@@ -82,11 +121,21 @@ var defaultCoreKeys = [...]string{
 	StartUTC,
 	Duration,
 	RouterName,
+	ServiceAddr,
 	ServiceName,
 	ServiceURL,
+	ClientAddr,
 	ClientHost,
 	ClientPort,
 	ClientUsername,
+	GzipRatio,
+	StartLocal,
+	Overhead,
+	RetryAttempts,
+	TLSVersion,
+	TLSCipher,
+	TLSClientSubject,
+	RequestAddr,
 	RequestHost,
 	RequestPort,
 	RequestMethod,
@@ -109,19 +158,10 @@ func init() {
 	for _, k := range defaultCoreKeys {
 		allCoreKeys[k] = struct{}{}
 	}
-	allCoreKeys[ServiceAddr] = struct{}{}
-	allCoreKeys[ClientAddr] = struct{}{}
-	allCoreKeys[RequestAddr] = struct{}{}
-	allCoreKeys[GzipRatio] = struct{}{}
-	allCoreKeys[StartLocal] = struct{}{}
-	allCoreKeys[Overhead] = struct{}{}
-	allCoreKeys[RetryAttempts] = struct{}{}
-	allCoreKeys[TLSVersion] = struct{}{}
-	allCoreKeys[TLSCipher] = struct{}{}
 }
 
 // CoreLogData holds the fields computed from the request/response.
-type CoreLogData map[string]interface{}
+type CoreLogData map[string]any
 
 // LogData is the data captured by the middleware so that it can be logged.
 type LogData struct {

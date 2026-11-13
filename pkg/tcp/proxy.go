@@ -1,61 +1,42 @@
 package tcp
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"net"
+	"syscall"
 	"time"
 
-	"github.com/pires/go-proxyproto"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
 )
 
 // Proxy forwards a TCP request to a TCP service.
 type Proxy struct {
-	address          string
-	target           *net.TCPAddr
-	terminationDelay time.Duration
-	proxyProtocol    *dynamic.ProxyProtocol
-	refreshTarget    bool
+	address string
+	dialer  Dialer
 }
 
 // NewProxy creates a new Proxy.
-func NewProxy(address string, terminationDelay time.Duration, proxyProtocol *dynamic.ProxyProtocol) (*Proxy, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
-	if err != nil {
-		return nil, err
-	}
-
-	if proxyProtocol != nil && (proxyProtocol.Version < 1 || proxyProtocol.Version > 2) {
-		return nil, fmt.Errorf("unknown proxyProtocol version: %d", proxyProtocol.Version)
-	}
-
-	// enable the refresh of the target only if the address in not an IP
-	refreshTarget := false
-	if host, _, err := net.SplitHostPort(address); err == nil && net.ParseIP(host) == nil {
-		refreshTarget = true
-	}
-
+func NewProxy(address string, dialer Dialer) (*Proxy, error) {
 	return &Proxy{
-		address:          address,
-		target:           tcpAddr,
-		refreshTarget:    refreshTarget,
-		terminationDelay: terminationDelay,
-		proxyProtocol:    proxyProtocol,
+		address: address,
+		dialer:  dialer,
 	}, nil
 }
 
 // ServeTCP forwards the connection to a service.
 func (p *Proxy) ServeTCP(conn WriteCloser) {
-	log.WithoutContext().Debugf("Handling connection from %s", conn.RemoteAddr())
+	log.Debug().
+		Str("address", p.address).
+		Str("remoteAddr", conn.RemoteAddr().String()).
+		Msg("Handling TCP connection")
 
 	// needed because of e.g. server.trackedConnection
 	defer conn.Close()
 
-	connBackend, err := p.dialBackend()
+	connBackend, err := p.dialBackend(conn)
 	if err != nil {
-		log.WithoutContext().Errorf("Error while connecting to backend: %v", err)
+		log.Error().Err(err).Msg("Error while dialing backend")
 		return
 	}
 
@@ -63,52 +44,80 @@ func (p *Proxy) ServeTCP(conn WriteCloser) {
 	defer connBackend.Close()
 	errChan := make(chan error)
 
-	if p.proxyProtocol != nil && p.proxyProtocol.Version > 0 && p.proxyProtocol.Version < 3 {
-		header := proxyproto.HeaderProxyFromAddrs(byte(p.proxyProtocol.Version), conn.RemoteAddr(), conn.LocalAddr())
-		if _, err := header.WriteTo(connBackend); err != nil {
-			log.WithoutContext().Errorf("Error while writing proxy protocol headers to backend connection: %v", err)
-			return
-		}
-	}
-
 	go p.connCopy(conn, connBackend, errChan)
 	go p.connCopy(connBackend, conn, errChan)
 
 	err = <-errChan
 	if err != nil {
-		log.WithoutContext().Errorf("Error during connection: %v", err)
+		// Treat connection reset error during a read operation with a lower log level.
+		// This allows to not report an RST packet sent by the peer as an error,
+		// as it is an abrupt but possible end for the TCP session
+		if isReadConnResetError(err) {
+			log.Debug().Err(err).Msg("Error while handling TCP connection")
+		} else {
+			log.Error().Err(err).Msg("Error while handling TCP connection")
+		}
 	}
 
 	<-errChan
 }
 
-func (p Proxy) dialBackend() (*net.TCPConn, error) {
-	if !p.refreshTarget {
-		return net.DialTCP("tcp", nil, p.target)
-	}
-
-	conn, err := net.Dial("tcp", p.address)
+func (p *Proxy) dialBackend(clientConn net.Conn) (WriteCloser, error) {
+	// The clientConn is passed to the dialer so that it can use information from it if needed,
+	// to build a PROXY protocol header.
+	conn, err := p.dialer.Dial("tcp", p.address, clientConn)
 	if err != nil {
 		return nil, err
 	}
 
-	return conn.(*net.TCPConn), nil
+	return conn.(WriteCloser), nil
 }
 
-func (p Proxy) connCopy(dst, src WriteCloser, errCh chan error) {
+func (p *Proxy) connCopy(dst, src WriteCloser, errCh chan error) {
 	_, err := io.Copy(dst, src)
 	errCh <- err
 
+	// Ends the connection with the dst connection peer.
+	// It corresponds to sending a FIN packet to gracefully end the TCP session.
 	errClose := dst.CloseWrite()
 	if errClose != nil {
-		log.WithoutContext().Debugf("Error while terminating connection: %v", errClose)
+		// Calling CloseWrite() on a connection which have a socket which is "not connected" is expected to fail.
+		// It happens notably when the dst connection has ended receiving an RST packet from the peer (within the other connCopy call).
+		// In that case, logging the error is superfluous,
+		// as in the first place we should not have needed to call CloseWrite.
+		if !isSocketNotConnectedError(errClose) {
+			log.Debug().Err(errClose).Msg("Error while terminating TCP connection")
+		}
+
 		return
 	}
 
-	if p.terminationDelay >= 0 {
-		err := dst.SetReadDeadline(time.Now().Add(p.terminationDelay))
+	if p.dialer.TerminationDelay() >= 0 {
+		err := dst.SetReadDeadline(time.Now().Add(p.dialer.TerminationDelay()))
 		if err != nil {
-			log.WithoutContext().Debugf("Error while setting deadline: %v", err)
+			log.Debug().Err(err).Msg("Error while setting TCP connection deadline")
 		}
 	}
+}
+
+// isSocketNotConnectedError reports whether err is a socket not connected error.
+func isSocketNotConnectedError(err error) bool {
+	_, ok := errors.AsType[*net.OpError](err)
+	return ok && errors.Is(err, syscall.ENOTCONN)
+}
+
+// isReadConnResetError reports whether err is a connection reset error during a read operation.
+// The read error may be wrapped in another net.OpError (e.g. "readfrom" or "writeto"),
+// as io.Copy relies on (*net.TCPConn).ReadFrom or (*net.TCPConn).WriteTo when available.
+func isReadConnResetError(err error) bool {
+	oerr, ok := errors.AsType[*net.OpError](err)
+	if !ok {
+		return false
+	}
+
+	if oerr.Op == "read" {
+		return errors.Is(oerr.Err, errConnReset)
+	}
+
+	return isReadConnResetError(oerr.Err)
 }

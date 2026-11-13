@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,8 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/testhelpers"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/testhelpers"
 )
 
 func TestDigestAuthError(t *testing.T) {
@@ -21,10 +20,10 @@ func TestDigestAuthError(t *testing.T) {
 	})
 
 	auth := dynamic.DigestAuth{
-		Users: []string{"test"},
+		Users: []string{"test:traefik:a2688e031edb4be6a3797f3882655c05", "test"},
 	}
-	_, err := NewDigest(context.Background(), next, auth, "authName")
-	assert.Error(t, err)
+	_, err := NewDigest(t.Context(), next, auth, "authName")
+	assert.EqualError(t, err, "parsing user at index 1: expected user:realm:hash format")
 }
 
 func TestDigestAuthFail(t *testing.T) {
@@ -35,7 +34,7 @@ func TestDigestAuthFail(t *testing.T) {
 	auth := dynamic.DigestAuth{
 		Users: []string{"test:traefik:a2688e031edb4be6a3797f3882655c05"},
 	}
-	authMiddleware, err := NewDigest(context.Background(), next, auth, "authName")
+	authMiddleware, err := NewDigest(t.Context(), next, auth, "authName")
 	require.NoError(t, err)
 	assert.NotNil(t, authMiddleware, "this should not be nil")
 
@@ -88,7 +87,6 @@ func TestDigestAuthUsersFromFile(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -96,7 +94,7 @@ func TestDigestAuthUsersFromFile(t *testing.T) {
 			usersFile, err := os.CreateTemp(t.TempDir(), "auth-users")
 			require.NoError(t, err)
 
-			_, err = usersFile.Write([]byte(test.userFileContent))
+			_, err = usersFile.WriteString(test.userFileContent)
 			require.NoError(t, err)
 
 			// Creates the configuration for our Authenticator
@@ -110,7 +108,7 @@ func TestDigestAuthUsersFromFile(t *testing.T) {
 				fmt.Fprintln(w, "traefik")
 			})
 
-			authenticator, err := NewDigest(context.Background(), next, authenticatorConfiguration, "authName")
+			authenticator, err := NewDigest(t.Context(), next, authenticatorConfiguration, "authName")
 			require.NoError(t, err)
 
 			ts := httptest.NewServer(authenticator)
@@ -152,4 +150,31 @@ func TestDigestAuthUsersFromFile(t *testing.T) {
 			require.NotContains(t, "traefik", string(body))
 		})
 	}
+}
+
+func TestDigestAuthUserHeaderCanonical(t *testing.T) {
+	var nextCalled bool
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		nextCalled = true
+		assert.Empty(t, req.Header.Get("X-User"))
+		assert.Equal(t, []string{"test"}, req.Header["x-user"])
+	})
+	auth := dynamic.DigestAuth{
+		Users:       []string{"test:traefik:a2688e031edb4be6a3797f3882655c05"},
+		HeaderField: "x-user",
+	}
+	m, err := NewDigest(t.Context(), next, auth, "test")
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(m)
+	t.Cleanup(srv.Close)
+
+	req := testhelpers.MustNewRequest(http.MethodGet, srv.URL, nil)
+	req.Header.Set("X-User", "admin")
+	digestReq := newDigestRequest("test", "test", http.DefaultClient)
+	res, err := digestReq.Do(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.True(t, nextCalled)
 }

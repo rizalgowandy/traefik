@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 )
 
 func TestNewHeader_customRequestHeader(t *testing.T) {
@@ -29,11 +29,14 @@ func TestNewHeader_customRequestHeader(t *testing.T) {
 			desc: "delete a header",
 			cfg: dynamic.Headers{
 				CustomRequestHeaders: map[string]string{
+					"X-Forwarded-For":         "",
 					"X-Custom-Request-Header": "",
 					"Foo":                     "",
 				},
 			},
-			expected: http.Header{},
+			expected: http.Header{
+				"X-Forwarded-For": nil,
+			},
 		},
 		{
 			desc: "override a header",
@@ -49,7 +52,6 @@ func TestNewHeader_customRequestHeader(t *testing.T) {
 	emptyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -124,7 +126,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 			cfg: dynamic.Headers{
 				AccessControlAllowMethods:    []string{"GET", "OPTIONS", "PUT"},
 				AccessControlAllowOriginList: []string{"https://foo.bar.org"},
-				AccessControlMaxAge:          600,
+				AccessControlMaxAge:          new(int64(600)),
 			},
 			requestHeaders: map[string][]string{
 				"Access-Control-Request-Headers": {"origin"},
@@ -132,6 +134,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				"Origin":                         {"https://foo.bar.org"},
 			},
 			expected: map[string][]string{
+				"Content-Length":               {"0"},
 				"Access-Control-Allow-Origin":  {"https://foo.bar.org"},
 				"Access-Control-Max-Age":       {"600"},
 				"Access-Control-Allow-Methods": {"GET,OPTIONS,PUT"},
@@ -142,7 +145,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 			cfg: dynamic.Headers{
 				AccessControlAllowMethods:    []string{"GET", "OPTIONS", "PUT"},
 				AccessControlAllowOriginList: []string{"*"},
-				AccessControlMaxAge:          600,
+				AccessControlMaxAge:          new(int64(600)),
 			},
 			requestHeaders: map[string][]string{
 				"Access-Control-Request-Headers": {"origin"},
@@ -150,6 +153,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				"Origin":                         {"https://foo.bar.org"},
 			},
 			expected: map[string][]string{
+				"Content-Length":               {"0"},
 				"Access-Control-Allow-Origin":  {"*"},
 				"Access-Control-Max-Age":       {"600"},
 				"Access-Control-Allow-Methods": {"GET,OPTIONS,PUT"},
@@ -161,7 +165,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				AccessControlAllowMethods:     []string{"GET", "OPTIONS", "PUT"},
 				AccessControlAllowOriginList:  []string{"*"},
 				AccessControlAllowCredentials: true,
-				AccessControlMaxAge:           600,
+				AccessControlMaxAge:           new(int64(600)),
 			},
 			requestHeaders: map[string][]string{
 				"Access-Control-Request-Headers": {"origin"},
@@ -169,7 +173,8 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				"Origin":                         {"https://foo.bar.org"},
 			},
 			expected: map[string][]string{
-				"Access-Control-Allow-Origin":      {"*"},
+				"Content-Length":                   {"0"},
+				"Access-Control-Allow-Origin":      {"https://foo.bar.org"},
 				"Access-Control-Max-Age":           {"600"},
 				"Access-Control-Allow-Methods":     {"GET,OPTIONS,PUT"},
 				"Access-Control-Allow-Credentials": {"true"},
@@ -181,7 +186,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				AccessControlAllowMethods:    []string{"GET", "OPTIONS", "PUT"},
 				AccessControlAllowOriginList: []string{"*"},
 				AccessControlAllowHeaders:    []string{"origin", "X-Forwarded-For"},
-				AccessControlMaxAge:          600,
+				AccessControlMaxAge:          new(int64(600)),
 			},
 			requestHeaders: map[string][]string{
 				"Access-Control-Request-Headers": {"origin"},
@@ -189,6 +194,7 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				"Origin":                         {"https://foo.bar.org"},
 			},
 			expected: map[string][]string{
+				"Content-Length":               {"0"},
 				"Access-Control-Allow-Origin":  {"*"},
 				"Access-Control-Max-Age":       {"600"},
 				"Access-Control-Allow-Methods": {"GET,OPTIONS,PUT"},
@@ -201,17 +207,35 @@ func TestNewHeader_CORSPreflights(t *testing.T) {
 				AccessControlAllowMethods:    []string{"GET", "OPTIONS", "PUT"},
 				AccessControlAllowOriginList: []string{"*"},
 				AccessControlAllowHeaders:    []string{"origin", "X-Forwarded-For"},
-				AccessControlMaxAge:          600,
+				AccessControlMaxAge:          new(int64(600)),
 			},
 			requestHeaders: map[string][]string{
 				"Access-Control-Request-Method": {"GET", "OPTIONS"},
 				"Origin":                        {"https://foo.bar.org"},
 			},
 			expected: map[string][]string{
+				"Content-Length":               {"0"},
 				"Access-Control-Allow-Origin":  {"*"},
 				"Access-Control-Max-Age":       {"600"},
 				"Access-Control-Allow-Methods": {"GET,OPTIONS,PUT"},
 				"Access-Control-Allow-Headers": {"origin,X-Forwarded-For"},
+			},
+		},
+		{
+			desc: "Nil MaxAge Preflight",
+			cfg: dynamic.Headers{
+				AccessControlAllowMethods:    []string{"GET", "OPTIONS", "PUT"},
+				AccessControlAllowOriginList: []string{"*"},
+				AccessControlMaxAge:          nil,
+			},
+			requestHeaders: map[string][]string{
+				"Access-Control-Request-Method": {"GET", "OPTIONS"},
+				"Origin":                        {"https://foo.bar.org"},
+			},
+			expected: map[string][]string{
+				"Content-Length":               {"0"},
+				"Access-Control-Allow-Origin":  {"*"},
+				"Access-Control-Allow-Methods": {"GET,OPTIONS,PUT"},
 			},
 		},
 	}
@@ -346,7 +370,7 @@ func TestNewHeader_CORSResponses(t *testing.T) {
 				"Origin": {"https://foo.bar.org"},
 			},
 			expected: map[string][]string{
-				"Access-Control-Allow-Origin":      {"*"},
+				"Access-Control-Allow-Origin":      {"https://foo.bar.org"},
 				"Access-Control-Allow-Credentials": {"true"},
 			},
 		},

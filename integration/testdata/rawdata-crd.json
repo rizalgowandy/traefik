@@ -6,6 +6,20 @@
 			],
 			"service": "api@internal",
 			"rule": "PathPrefix(`/api`)",
+			"priority": 18,
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "default",
+						"name": "api.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
 			"status": "enabled",
 			"using": [
 				"web"
@@ -21,6 +35,19 @@
 			"tls": {
 				"options": "default-mytlsoption"
 			},
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "default",
+						"name": "test.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
 			"status": "enabled",
 			"using": [
 				"web"
@@ -35,6 +62,20 @@
 			],
 			"service": "default-test2-route-23c7f4c450289ee29016",
 			"rule": "Host(`foo.com`) \u0026\u0026 PathPrefix(`/tobestripped`)",
+			"priority": 46,
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "default",
+						"name": "test2.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
 			"status": "enabled",
 			"using": [
 				"web"
@@ -46,6 +87,45 @@
 			],
 			"service": "default-wrr1",
 			"rule": "Host(`foo.com`) \u0026\u0026 PathPrefix(`/wrr1`)",
+			"priority": 38,
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "default",
+						"name": "test3.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
+			"status": "enabled",
+			"using": [
+				"web"
+			]
+		},
+		"default-test4-route-466d8d3a547de55dfe8a@kubernetescrd": {
+			"entryPoints": [
+				"web"
+			],
+			"service": "default-hrw1",
+			"rule": "Host(`foo.com`) \u0026\u0026 PathPrefix(`/hrw1`)",
+			"priority": 38,
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "default",
+						"name": "test4.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
 			"status": "enabled",
 			"using": [
 				"web"
@@ -57,6 +137,20 @@
 			],
 			"service": "default-testst-route-60ad45fcb5fc1f5f3629",
 			"rule": "Host(`foo.com`) \u0026\u0026 PathPrefix(`/serverstransport`)",
+			"priority": 50,
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "default",
+						"name": "testst.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
 			"status": "enabled",
 			"using": [
 				"web"
@@ -68,6 +162,20 @@
 			],
 			"service": "other-ns-wrr3",
 			"rule": "Host(`foo.com`) \u0026\u0026 PathPrefix(`/c`)",
+			"priority": 35,
+			"observability": {
+				"accessLogs": true,
+				"metrics": true,
+				"tracing": true,
+				"traceVerbosity": "minimal",
+				"metadata": {
+					"ingress": {
+						"namespace": "other-ns",
+						"name": "test6.route",
+						"kind": "IngressRoute"
+					}
+				}
+			},
 			"error": [
 				"the service \"other-ns-wrr3@kubernetescrd\" does not exist"
 			],
@@ -116,6 +224,24 @@
 		"dashboard@internal": {
 			"status": "enabled"
 		},
+		"default-hrw1@kubernetescrd": {
+			"highestRandomWeight": {
+				"services": [
+					{
+						"name": "default-whoami-80",
+						"weight": 10
+					},
+					{
+						"name": "default-whoami-80",
+						"weight": 20
+					}
+				]
+			},
+			"status": "enabled",
+			"usedBy": [
+				"default-test4-route-466d8d3a547de55dfe8a@kubernetescrd"
+			]
+		},
 		"default-mirror1@kubernetescrd": {
 			"mirroring": {
 				"service": "default-whoami-80",
@@ -131,82 +257,134 @@
 			"loadBalancer": {
 				"servers": [
 					{
-						"url": "http://10.42.0.6:80"
+						"url": "http://10.42.0.8:80"
 					},
 					{
-						"url": "http://10.42.0.7:80"
+						"url": "http://10.42.0.4:80"
 					}
 				],
-				"passHostHeader": true
+				"strategy": "wrr",
+				"passHostHeader": true,
+				"responseForwarding": {
+					"flushInterval": "100ms"
+				}
+			},
+			"observability": {
+				"metadata": {
+					"kubernetes": {
+						"namespace": "default",
+						"name": "whoami",
+						"port": "80"
+					}
+				}
 			},
 			"status": "enabled",
 			"usedBy": [
 				"default-test-route-6b204d94623b3df4370c@kubernetescrd"
 			],
 			"serverStatus": {
-				"http://10.42.0.6:80": "UP",
-				"http://10.42.0.7:80": "UP"
+				"http://10.42.0.4:80": "UP",
+				"http://10.42.0.8:80": "UP"
 			}
 		},
 		"default-test2-route-23c7f4c450289ee29016@kubernetescrd": {
 			"loadBalancer": {
 				"servers": [
 					{
-						"url": "http://10.42.0.6:80"
+						"url": "http://10.42.0.8:80"
 					},
 					{
-						"url": "http://10.42.0.7:80"
+						"url": "http://10.42.0.4:80"
 					}
 				],
-				"passHostHeader": true
+				"strategy": "wrr",
+				"passHostHeader": true,
+				"responseForwarding": {
+					"flushInterval": "100ms"
+				}
+			},
+			"observability": {
+				"metadata": {
+					"kubernetes": {
+						"namespace": "default",
+						"name": "whoami",
+						"port": "80"
+					}
+				}
 			},
 			"status": "enabled",
 			"usedBy": [
 				"default-test2-route-23c7f4c450289ee29016@kubernetescrd"
 			],
 			"serverStatus": {
-				"http://10.42.0.6:80": "UP",
-				"http://10.42.0.7:80": "UP"
+				"http://10.42.0.4:80": "UP",
+				"http://10.42.0.8:80": "UP"
 			}
 		},
 		"default-testst-route-60ad45fcb5fc1f5f3629@kubernetescrd": {
 			"loadBalancer": {
 				"servers": [
 					{
-						"url": "http://10.42.0.6:80"
+						"url": "http://10.42.0.8:80"
 					},
 					{
-						"url": "http://10.42.0.7:80"
+						"url": "http://10.42.0.4:80"
 					}
 				],
+				"strategy": "wrr",
 				"passHostHeader": true,
+				"responseForwarding": {
+					"flushInterval": "100ms"
+				},
 				"serversTransport": "default-mytransport@kubernetescrd"
+			},
+			"observability": {
+				"metadata": {
+					"kubernetes": {
+						"namespace": "default",
+						"name": "whoami",
+						"port": "80"
+					}
+				}
 			},
 			"status": "enabled",
 			"usedBy": [
 				"default-testst-route-60ad45fcb5fc1f5f3629@kubernetescrd"
 			],
 			"serverStatus": {
-				"http://10.42.0.6:80": "UP",
-				"http://10.42.0.7:80": "UP"
+				"http://10.42.0.4:80": "UP",
+				"http://10.42.0.8:80": "UP"
 			}
 		},
 		"default-whoami-80@kubernetescrd": {
 			"loadBalancer": {
 				"servers": [
 					{
-						"url": "http://10.42.0.6:80"
+						"url": "http://10.42.0.8:80"
 					},
 					{
-						"url": "http://10.42.0.7:80"
+						"url": "http://10.42.0.4:80"
 					}
 				],
-				"passHostHeader": true
+				"strategy": "wrr",
+				"passHostHeader": true,
+				"responseForwarding": {
+					"flushInterval": "100ms"
+				}
+			},
+			"observability": {
+				"metadata": {
+					"kubernetes": {
+						"namespace": "default",
+						"name": "whoami",
+						"port": "80"
+					}
+				}
 			},
 			"status": "enabled",
 			"serverStatus": {
-				"http://10.42.0.6:80": "UP",
-				"http://10.42.0.7:80": "UP"
+				"http://10.42.0.4:80": "UP",
+				"http://10.42.0.8:80": "UP"
 			}
 		},
 		"default-wrr1@kubernetescrd": {
@@ -249,6 +427,7 @@
 			],
 			"service": "default-test3.route-673acf455cb2dab0b43a",
 			"rule": "HostSNI(`*`)",
+			"priority": -1,
 			"tls": {
 				"passthrough": false,
 				"options": "default-mytlsoption"
@@ -262,28 +441,33 @@
 	"tcpServices": {
 		"default-test3.route-673acf455cb2dab0b43a-externalname-svc-9090@kubernetescrd": {
 			"loadBalancer": {
-				"terminationDelay": 100,
 				"servers": [
 					{
 						"address": "domain.com:9090"
 					}
 				]
 			},
-			"status": "enabled"
+			"status": "enabled",
+			"serverStatus": {
+				"domain.com:9090": "UP"
+			}
 		},
 		"default-test3.route-673acf455cb2dab0b43a-whoamitcp-8080@kubernetescrd": {
 			"loadBalancer": {
-				"terminationDelay": 100,
 				"servers": [
 					{
-						"address": "10.42.0.10:8080"
+						"address": "10.42.0.7:8080"
 					},
 					{
-						"address": "10.42.0.8:8080"
+						"address": "10.42.0.9:8080"
 					}
 				]
 			},
-			"status": "enabled"
+			"status": "enabled",
+			"serverStatus": {
+				"10.42.0.7:8080": "UP",
+				"10.42.0.9:8080": "UP"
+			}
 		},
 		"default-test3.route-673acf455cb2dab0b43a@kubernetescrd": {
 			"weighted": {
@@ -331,10 +515,10 @@
 			"loadBalancer": {
 				"servers": [
 					{
-						"address": "10.42.0.4:8090"
+						"address": "10.42.0.2:8090"
 					},
 					{
-						"address": "10.42.0.9:8090"
+						"address": "10.42.0.6:8090"
 					}
 				]
 			},

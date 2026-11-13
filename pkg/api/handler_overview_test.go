@@ -10,18 +10,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/config/static"
-	"github.com/traefik/traefik/v2/pkg/provider/docker"
-	"github.com/traefik/traefik/v2/pkg/provider/file"
-	"github.com/traefik/traefik/v2/pkg/provider/kubernetes/crd"
-	"github.com/traefik/traefik/v2/pkg/provider/kubernetes/ingress"
-	"github.com/traefik/traefik/v2/pkg/provider/marathon"
-	"github.com/traefik/traefik/v2/pkg/provider/rancher"
-	"github.com/traefik/traefik/v2/pkg/provider/rest"
-	"github.com/traefik/traefik/v2/pkg/tracing/jaeger"
-	"github.com/traefik/traefik/v2/pkg/types"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/config/static"
+	otypes "github.com/traefik/traefik/v3/pkg/observability/types"
+	"github.com/traefik/traefik/v3/pkg/provider/docker"
+	"github.com/traefik/traefik/v3/pkg/provider/file"
+	"github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd"
+	"github.com/traefik/traefik/v3/pkg/provider/kubernetes/ingress"
+	"github.com/traefik/traefik/v3/pkg/provider/rest"
 )
 
 func TestHandler_Overview(t *testing.T) {
@@ -172,24 +169,24 @@ func TestHandler_Overview(t *testing.T) {
 					},
 				},
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
-					"ipwhitelist1@myprovider": {
+					"ipallowlist1@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						Status: runtime.StatusEnabled,
 					},
-					"ipwhitelist2@myprovider": {
+					"ipallowlist2@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 					},
-					"ipwhitelist3@myprovider": {
+					"ipallowlist3@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -235,15 +232,15 @@ func TestHandler_Overview(t *testing.T) {
 				Global: &static.Global{},
 				API:    &static.API{},
 				Providers: &static.Providers{
+					Precedence:        []string{"foo"},
 					Docker:            &docker.Provider{},
+					Swarm:             &docker.SwarmProvider{},
 					File:              &file.Provider{},
-					Marathon:          &marathon.Provider{},
 					KubernetesIngress: &ingress.Provider{},
 					KubernetesCRD:     &crd.Provider{},
 					Rest:              &rest.Provider{},
-					Rancher:           &rancher.Provider{},
 					Plugin: map[string]static.PluginConf{
-						"test": map[string]interface{}{},
+						"test": map[string]any{},
 					},
 				},
 			},
@@ -259,12 +256,10 @@ func TestHandler_Overview(t *testing.T) {
 			confStatic: static.Configuration{
 				Global: &static.Global{},
 				API:    &static.API{},
-				Metrics: &types.Metrics{
-					Prometheus: &types.Prometheus{},
+				Metrics: &otypes.Metrics{
+					Prometheus: &otypes.Prometheus{},
 				},
-				Tracing: &static.Tracing{
-					Jaeger: &jaeger.Config{},
-				},
+				Tracing: &static.Tracing{},
 			},
 			confDyn: runtime.Configuration{},
 			expected: expected{
@@ -275,7 +270,6 @@ func TestHandler_Overview(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -291,7 +285,7 @@ func TestHandler_Overview(t *testing.T) {
 				return
 			}
 
-			assert.Equal(t, resp.Header.Get("Content-Type"), "application/json")
+			assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 			contents, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
@@ -299,7 +293,7 @@ func TestHandler_Overview(t *testing.T) {
 			require.NoError(t, err)
 
 			if *updateExpected {
-				var results interface{}
+				var results any
 				err := json.Unmarshal(contents, &results)
 				require.NoError(t, err)
 

@@ -1,17 +1,16 @@
 <!--
 PLEASE READ THIS MESSAGE.
 
-Documentation fixes or enhancements:
-- for Traefik v1: use branch v1.7
-- for Traefik v2: use branch v2.5
+Documentation:
+- for Traefik v2: use branch v2.11 (fixes only)
+- for Traefik v3.7: use branch v3.7
 
-Bug fixes:
-- for Traefik v1: use branch v1.7
-- for Traefik v2: use branch v2.5
+Bug:
+- for Traefik v2: use branch v2.11 (security fixes only)
+- for Traefik v3.7: use branch v3.7
 
 Enhancements:
-- for Traefik v1: we only accept bug fixes
-- for Traefik v2: use branch master
+- use branch master
 
 HOW TO WRITE A GOOD PULL REQUEST? https://doc.traefik.io/traefik/contributing/submitting-pull-requests/
 

@@ -6,12 +6,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/middlewares"
-	"github.com/traefik/traefik/v2/pkg/middlewares/stripprefix"
-	"github.com/traefik/traefik/v2/pkg/tracing"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares"
+	"github.com/traefik/traefik/v3/pkg/middlewares/stripprefix"
 )
 
 const (
@@ -27,7 +24,7 @@ type stripPrefixRegex struct {
 
 // New builds a new StripPrefixRegex middleware.
 func New(ctx context.Context, next http.Handler, config dynamic.StripPrefixRegex, name string) (http.Handler, error) {
-	log.FromContext(middlewares.GetLoggerCtx(ctx, name, typeName)).Debug("Creating middleware")
+	middlewares.GetLogger(ctx, name, typeName).Debug().Msg("Creating middleware")
 
 	stripPrefix := stripPrefixRegex{
 		next: next,
@@ -45,11 +42,13 @@ func New(ctx context.Context, next http.Handler, config dynamic.StripPrefixRegex
 	return &stripPrefix, nil
 }
 
-func (s *stripPrefixRegex) GetTracingInformation() (string, ext.SpanKindEnum) {
-	return s.name, tracing.SpanKindNoneEnum
+func (s *stripPrefixRegex) GetTracingInformation() (string, string) {
+	return s.name, typeName
 }
 
 func (s *stripPrefixRegex) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	logger := middlewares.GetLogger(req.Context(), s.name, typeName)
+
 	for _, exp := range s.expressions {
 		parts := exp.FindStringSubmatch(req.URL.Path)
 		if len(parts) > 0 && len(parts[0]) > 0 {
@@ -58,20 +57,52 @@ func (s *stripPrefixRegex) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 				continue
 			}
 
+			// Note: the header names aliasing the ForwardedPrefixHeader (e.g. X_Forwarded_Prefix) are not handled here,
+			// as the aliasHeadersStrategy entry point option is expected to be enabled to prevent header spoofing.
 			req.Header.Add(stripprefix.ForwardedPrefixHeader, prefix)
 
 			req.URL.Path = ensureLeadingSlash(strings.Replace(req.URL.Path, prefix, "", 1))
 			if req.URL.RawPath != "" {
-				req.URL.RawPath = ensureLeadingSlash(req.URL.RawPath[len(prefix):])
+				req.URL.RawPath = ensureLeadingSlash(req.URL.RawPath[encodedPrefixLen(req.URL.RawPath, prefix):])
+			}
+
+			// Here we are sanitizing the URL when the path is not empty,
+			// as the JoinPath method is adding a leading slash if the path is empty
+			// to be aligned with ensureLeadingSlash behavior.
+			path := req.URL.Path
+			if path != "" {
+				req.URL = req.URL.JoinPath()
+			}
+
+			// Stop here if the normalization of the path produces a different path.
+			if path != req.URL.Path {
+				logger.Debug().Msgf("Rejecting request, sanitized path: %q is not equivalent to stripped path: %q", path, req.URL.Path)
+				http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				return
 			}
 
 			req.RequestURI = req.URL.RequestURI()
-			s.next.ServeHTTP(rw, req)
-			return
+			break
 		}
 	}
 
 	s.next.ServeHTTP(rw, req)
+}
+
+// encodedPrefixLen returns the number of bytes in rawPath that correspond to
+// the decoded prefix, advancing 3 bytes per %XX sequence and 1 byte otherwise.
+func encodedPrefixLen(rawPath, decodedPrefix string) int {
+	decoded := 0
+	i := 0
+	for i < len(rawPath) && decoded < len(decodedPrefix) {
+		if rawPath[i] == '%' && i+2 < len(rawPath) {
+			i += 3
+		} else {
+			i++
+		}
+		decoded++
+	}
+	return i
 }
 
 func ensureLeadingSlash(str string) string {

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"io"
 	"net"
 	"testing"
@@ -9,8 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	ptypes "github.com/traefik/paerser/types"
-	"github.com/traefik/traefik/v2/pkg/config/static"
-	"github.com/traefik/traefik/v2/pkg/udp"
+	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/udp"
 )
 
 func TestShutdownUDPConn(t *testing.T) {
@@ -24,24 +23,27 @@ func TestShutdownUDPConn(t *testing.T) {
 	}
 	ep.SetDefaults()
 
-	entryPoint, err := NewUDPEntryPoint(&ep)
+	entryPoint, err := NewUDPEntryPoint(&ep, "")
 	require.NoError(t, err)
 
-	go entryPoint.Start(context.Background())
+	go entryPoint.Start(t.Context())
 	entryPoint.Switch(udp.HandlerFunc(func(conn *udp.Conn) {
 		for {
 			b := make([]byte, 1024*1024)
 			n, err := conn.Read(b)
-			require.NoError(t, err)
-			// We control the termination, otherwise we would block on the Read above, until
-			// conn is closed by a timeout. Which means we would get an error, and even though
-			// we are in a goroutine and the current test might be over, go test would still
-			// yell at us if this happens while other tests are still running.
+			if err != nil {
+				return
+			}
+
+			// We control the termination, otherwise we would block on the Read above,
+			// until conn is closed by a timeout.
+			// Which means we would get an error,
+			// and even though we are in a goroutine and the current test might be over,
+			// go test would still yell at us if this happens while other tests are still running.
 			if string(b[:n]) == "CLOSE" {
 				return
 			}
-			_, err = conn.Write(b[:n])
-			require.NoError(t, err)
+			_, _ = conn.Write(b[:n])
 		}
 	}))
 
@@ -51,11 +53,17 @@ func TestShutdownUDPConn(t *testing.T) {
 	// Start sending packets, to create a "session" with the server.
 	requireEcho(t, "TEST", conn, time.Second)
 
+	shutdownStartedChan := make(chan struct{})
 	doneChan := make(chan struct{})
 	go func() {
-		entryPoint.Shutdown(context.Background())
+		close(shutdownStartedChan)
+		entryPoint.Shutdown(t.Context())
 		close(doneChan)
 	}()
+
+	// Wait until shutdown has started, and hopefully after 100 ms the listener has stopped accepting new sessions.
+	<-shutdownStartedChan
+	time.Sleep(100 * time.Millisecond)
 
 	// Make sure that our session is still live even after the shutdown.
 	requireEcho(t, "TEST2", conn, time.Second)
@@ -68,9 +76,9 @@ func TestShutdownUDPConn(t *testing.T) {
 	// Packet is accepted, but dropped
 	require.NoError(t, err)
 
-	// Make sure that our session is yet again still live. This is specifically to
-	// make sure we don't create a regression in listener's readLoop, i.e. that we only
-	// terminate the listener's readLoop goroutine by closing its pConn.
+	// Make sure that our session is yet again still live.
+	// This is specifically to make sure we don't create a regression in listener's readLoop,
+	// i.e. that we only terminate the listener's readLoop goroutine by closing its pConn.
 	requireEcho(t, "TEST3", conn, time.Second)
 
 	done := make(chan bool)
@@ -101,10 +109,11 @@ func TestShutdownUDPConn(t *testing.T) {
 	}
 }
 
-// requireEcho tests that the conn session is live and functional, by writing
-// data through it, and expecting the same data as a response when reading on it.
-// It fatals if the read blocks longer than timeout, which is useful to detect
-// regressions that would make a test wait forever.
+// requireEcho tests that conn session is live and functional,
+// by writing data through it,
+// and expecting the same data as a response when reading on it.
+// It fatals if the read blocks longer than timeout,
+// which is useful to detect regressions that would make a test wait forever.
 func requireEcho(t *testing.T, data string, conn io.ReadWriter, timeout time.Duration) {
 	t.Helper()
 

@@ -1,4 +1,4 @@
-apiVersion: traefik.containo.us/v1alpha1
+apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: errorpage
@@ -9,7 +9,12 @@ spec:
     status:
     - "404"
     - "500"
+    statusRewrites:
+      404: 200
     query: query
+    errorRequestHeaders:
+    - "X-Foo-Bar"
+    - "X-Bar-Foo"
     service:
       name: whoami
       port: 80

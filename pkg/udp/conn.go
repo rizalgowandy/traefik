@@ -1,14 +1,17 @@
 package udp
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 )
 
-const receiveMTU = 8192
+// maxDatagramSize is the maximum size of a UDP datagram.
+const maxDatagramSize = 65535
 
 const closeRetryInterval = 500 * time.Millisecond
 
@@ -31,19 +34,19 @@ type Listener struct {
 	timeout time.Duration
 }
 
-// Listen creates a new listener.
-func Listen(network string, laddr *net.UDPAddr, timeout time.Duration) (*Listener, error) {
+// ListenPacketConn creates a new listener from PacketConn.
+func ListenPacketConn(packetConn net.PacketConn, timeout time.Duration) (*Listener, error) {
 	if timeout <= 0 {
 		return nil, errors.New("timeout should be greater than zero")
 	}
 
-	conn, err := net.ListenUDP(network, laddr)
-	if err != nil {
-		return nil, err
+	pConn, ok := packetConn.(*net.UDPConn)
+	if !ok {
+		return nil, errors.New("packet conn is not an UDPConn")
 	}
 
 	l := &Listener{
-		pConn:     conn,
+		pConn:     pConn,
 		acceptCh:  make(chan *Conn),
 		conns:     make(map[string]*Conn),
 		accepting: true,
@@ -51,6 +54,25 @@ func Listen(network string, laddr *net.UDPAddr, timeout time.Duration) (*Listene
 	}
 
 	go l.readLoop()
+
+	return l, nil
+}
+
+// Listen creates a new listener.
+func Listen(listenConfig net.ListenConfig, network, address string, timeout time.Duration) (*Listener, error) {
+	if timeout <= 0 {
+		return nil, errors.New("timeout should be greater than zero")
+	}
+
+	packetConn, err := listenConfig.ListenPacket(context.Background(), network, address)
+	if err != nil {
+		return nil, fmt.Errorf("listen packet: %w", err)
+	}
+
+	l, err := ListenPacketConn(packetConn, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("listen packet conn: %w", err)
+	}
 
 	return l, nil
 }
@@ -76,19 +98,6 @@ func (l *Listener) Close() error {
 	return l.Shutdown(0)
 }
 
-// close should not be called more than once.
-func (l *Listener) close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	err := l.pConn.Close()
-	for k, v := range l.conns {
-		v.close()
-		delete(l.conns, k)
-	}
-	close(l.acceptCh)
-	return err
-}
-
 // Shutdown closes the listener.
 // It immediately stops accepting new sessions,
 // and it waits for all existing sessions to terminate,
@@ -103,17 +112,10 @@ func (l *Listener) Shutdown(graceTimeout time.Duration) error {
 	l.accepting = false
 	l.mu.Unlock()
 
-	retryInterval := closeRetryInterval
-	if retryInterval > graceTimeout {
-		retryInterval = graceTimeout
-	}
+	retryInterval := min(closeRetryInterval, graceTimeout)
 	start := time.Now()
 	end := start.Add(graceTimeout)
-	for {
-		if time.Now().After(end) {
-			break
-		}
-
+	for !time.Now().After(end) {
 		l.mu.RLock()
 		if len(l.conns) == 0 {
 			l.mu.RUnlock()
@@ -126,16 +128,29 @@ func (l *Listener) Shutdown(graceTimeout time.Duration) error {
 	return l.close()
 }
 
+// close should not be called more than once.
+func (l *Listener) close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	err := l.pConn.Close()
+	for k, v := range l.conns {
+		v.close()
+		delete(l.conns, k)
+	}
+	close(l.acceptCh)
+	return err
+}
+
 // readLoop receives all packets from all remotes.
 // If a packet comes from a remote that is already known to us (i.e. a "session"),
 // we find that session, and otherwise we create a new one.
 // We then send the data the session's readLoop.
 func (l *Listener) readLoop() {
+	// The read buffer must be able to hold the largest possible datagram,
+	// as ReadFrom silently discards the bytes that do not fit.
+	buf := make([]byte, maxDatagramSize)
+
 	for {
-		// Allocating a new buffer for every read avoids
-		// overwriting data in c.msgs in case the next packet is received
-		// before c.msgs is emptied via Read()
-		buf := make([]byte, receiveMTU)
 		n, raddr, err := l.pConn.ReadFrom(buf)
 		if err != nil {
 			return
@@ -144,8 +159,15 @@ func (l *Listener) readLoop() {
 		if err != nil {
 			continue
 		}
+
+		// The datagram is copied into a buffer of its own size before being queued in c.msgs.
+		// Queuing buf[:n] directly would retain the whole maxDatagramSize backing array for each queued datagram,
+		// and would require allocating a new read buffer for every datagram to avoid overwriting queued data.
+		msg := make([]byte, n)
+		copy(msg, buf[:n])
+
 		select {
-		case conn.receiveCh <- buf[:n]:
+		case conn.receiveCh <- msg:
 		case <-conn.doneCh:
 			continue
 		}
@@ -204,6 +226,44 @@ type Conn struct {
 	doneCh   chan struct{}
 }
 
+// Read reads up to len(p) bytes into p from the connection.
+// Each call corresponds to at most one datagram.
+// If p is smaller than the datagram, the extra bytes will be discarded.
+func (c *Conn) Read(p []byte) (int, error) {
+	select {
+	case c.readCh <- p:
+		n := <-c.sizeCh
+		c.muActivity.Lock()
+		c.lastActivity = time.Now()
+		c.muActivity.Unlock()
+		return n, nil
+
+	case <-c.doneCh:
+		return 0, io.EOF
+	}
+}
+
+// Write writes len(p) bytes from p to the underlying connection.
+// Each call sends at most one datagram.
+// It is an error to send a message larger than the system's max UDP datagram size.
+func (c *Conn) Write(p []byte) (n int, err error) {
+	c.muActivity.Lock()
+	c.lastActivity = time.Now()
+	c.muActivity.Unlock()
+
+	return c.listener.pConn.WriteTo(p, c.rAddr)
+}
+
+// Close releases resources related to the Conn.
+func (c *Conn) Close() error {
+	c.close()
+
+	c.listener.mu.Lock()
+	defer c.listener.mu.Unlock()
+	delete(c.listener.conns, c.rAddr.String())
+	return nil
+}
+
 // readLoop waits for data to come from the listener's readLoop.
 // It then waits for a Read operation to be ready to consume said data,
 // that is to say it waits on readCh to receive the slice of bytes that the Read operation wants to read onto.
@@ -249,45 +309,8 @@ func (c *Conn) readLoop() {
 	}
 }
 
-// Read implements io.Reader for a Conn.
-func (c *Conn) Read(p []byte) (int, error) {
-	select {
-	case c.readCh <- p:
-		n := <-c.sizeCh
-		c.muActivity.Lock()
-		c.lastActivity = time.Now()
-		c.muActivity.Unlock()
-		return n, nil
-	case <-c.doneCh:
-		return 0, io.EOF
-	}
-}
-
-// Write implements io.Writer for a Conn.
-func (c *Conn) Write(p []byte) (n int, err error) {
-	l := c.listener
-	if l == nil {
-		return 0, io.EOF
-	}
-
-	c.muActivity.Lock()
-	c.lastActivity = time.Now()
-	c.muActivity.Unlock()
-	return l.pConn.WriteTo(p, c.rAddr)
-}
-
 func (c *Conn) close() {
 	c.doneOnce.Do(func() {
 		close(c.doneCh)
 	})
-}
-
-// Close releases resources related to the Conn.
-func (c *Conn) Close() error {
-	c.close()
-
-	c.listener.mu.Lock()
-	defer c.listener.mu.Unlock()
-	delete(c.listener.conns, c.rAddr.String())
-	return nil
 }

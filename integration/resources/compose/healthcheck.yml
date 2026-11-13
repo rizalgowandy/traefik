@@ -1,11 +1,12 @@
-whoami1:
-  image: traefik/whoami
+services:
+  whoami1:
+    image: traefik/whoami:v1.12.0
 
-whoami2:
-  image: traefik/whoami
+  whoami2:
+    image: traefik/whoami:v1.12.0
 
-whoami3:
-  image: traefik/whoami
+  whoami3:
+    image: traefik/whoami:v1.12.0
 
-whoami4:
-  image: traefik/whoami
+  whoami4:
+    image: traefik/whoami:v1.12.0

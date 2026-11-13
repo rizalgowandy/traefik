@@ -1,14 +1,13 @@
 package acme
 
 import (
-	"context"
 	"crypto/tls"
 	"testing"
+	"time"
 
-	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/stretchr/testify/assert"
-	"github.com/traefik/traefik/v2/pkg/safe"
-	"github.com/traefik/traefik/v2/pkg/types"
+	"github.com/traefik/traefik/v3/pkg/safe"
+	"github.com/traefik/traefik/v3/pkg/types"
 )
 
 func TestGetUncheckedCertificates(t *testing.T) {
@@ -25,7 +24,7 @@ func TestGetUncheckedCertificates(t *testing.T) {
 	domainSafe := &safe.Safe{}
 	domainSafe.Set(domainMap)
 
-	// FIXME Add a test for DefaultCertificate
+	// TODO Add a test for DefaultCertificate
 	testCases := []struct {
 		desc             string
 		dynamicCerts     *safe.Safe
@@ -50,9 +49,7 @@ func TestGetUncheckedCertificates(t *testing.T) {
 			domains: []string{"*.traefik.wtf"},
 			acmeCertificates: []*CertAndStore{
 				{
-					Certificate: Certificate{
-						Domain: types.Domain{Main: "*.traefik.wtf"},
-					},
+					Domain: types.Domain{Main: "*.traefik.wtf"},
 				},
 			},
 			expectedDomains: nil,
@@ -73,9 +70,7 @@ func TestGetUncheckedCertificates(t *testing.T) {
 			domains: []string{"traefik.wtf", "foo.traefik.wtf"},
 			acmeCertificates: []*CertAndStore{
 				{
-					Certificate: Certificate{
-						Domain: types.Domain{Main: "traefik.wtf"},
-					},
+					Domain: types.Domain{Main: "traefik.wtf"},
 				},
 			},
 			expectedDomains: []string{"foo.traefik.wtf"},
@@ -91,9 +86,7 @@ func TestGetUncheckedCertificates(t *testing.T) {
 			domains: []string{"traefik.wtf"},
 			acmeCertificates: []*CertAndStore{
 				{
-					Certificate: Certificate{
-						Domain: types.Domain{Main: "traefik.wtf"},
-					},
+					Domain: types.Domain{Main: "traefik.wtf"},
 				},
 			},
 			expectedDomains: nil,
@@ -109,9 +102,7 @@ func TestGetUncheckedCertificates(t *testing.T) {
 			domains: []string{"who.traefik.wtf", "foo.traefik.wtf"},
 			acmeCertificates: []*CertAndStore{
 				{
-					Certificate: Certificate{
-						Domain: types.Domain{Main: "*.traefik.wtf"},
-					},
+					Domain: types.Domain{Main: "*.traefik.wtf"},
 				},
 			},
 			expectedDomains: nil,
@@ -121,9 +112,7 @@ func TestGetUncheckedCertificates(t *testing.T) {
 			domains: []string{"traefik.wtf", "foo.traefik.wtf"},
 			acmeCertificates: []*CertAndStore{
 				{
-					Certificate: Certificate{
-						Domain: types.Domain{Main: "*.traefik.wtf"},
-					},
+					Domain: types.Domain{Main: "*.traefik.wtf"},
 				},
 			},
 			expectedDomains: []string{"traefik.wtf"},
@@ -165,7 +154,6 @@ func TestGetUncheckedCertificates(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -181,13 +169,13 @@ func TestGetUncheckedCertificates(t *testing.T) {
 				resolvingDomains: test.resolvingDomains,
 			}
 
-			domains := acmeProvider.getUncheckedDomains(context.Background(), test.domains, "default")
-			assert.Equal(t, len(test.expectedDomains), len(domains), "Unexpected domains.")
+			domains := acmeProvider.getUncheckedDomains(t.Context(), test.domains, "default")
+			assert.Len(t, domains, len(test.expectedDomains), "Unexpected domains.")
 		})
 	}
 }
 
-func TestGetValidDomain(t *testing.T) {
+func TestProvider_sanitizeDomains(t *testing.T) {
 	testCases := []struct {
 		desc            string
 		domains         types.Domain
@@ -213,21 +201,28 @@ func TestGetValidDomain(t *testing.T) {
 			desc:            "no domain",
 			domains:         types.Domain{},
 			dnsChallenge:    nil,
-			expectedErr:     "unable to generate a certificate in ACME provider when no domain is given",
-			expectedDomains: nil,
-		},
-		{
-			desc:            "no DNSChallenge",
-			domains:         types.Domain{Main: "*.traefik.wtf", SANs: []string{"foo.traefik.wtf"}},
-			dnsChallenge:    nil,
-			expectedErr:     "unable to generate a wildcard certificate in ACME provider for domain \"*.traefik.wtf,foo.traefik.wtf\" : ACME needs a DNSChallenge",
+			expectedErr:     "no domain was given",
 			expectedDomains: nil,
 		},
 		{
 			desc:            "unauthorized wildcard with SAN",
 			domains:         types.Domain{Main: "*.*.traefik.wtf", SANs: []string{"foo.traefik.wtf"}},
 			dnsChallenge:    &DNSChallenge{},
-			expectedErr:     "unable to generate a wildcard certificate in ACME provider for domain \"*.*.traefik.wtf,foo.traefik.wtf\" : ACME does not allow '*.*' wildcard domain",
+			expectedErr:     "unable to generate a wildcard certificate in ACME provider for domains \"*.*.traefik.wtf,foo.traefik.wtf\" : ACME does not allow '*.*' wildcard domain",
+			expectedDomains: nil,
+		},
+		{
+			desc:            "unauthorized double wildcard with SAN",
+			domains:         types.Domain{Main: "**.traefik.wtf", SANs: []string{"traefik.wtf"}},
+			dnsChallenge:    &DNSChallenge{},
+			expectedErr:     "unable to generate a wildcard certificate in ACME provider for domains \"**.traefik.wtf,traefik.wtf\" : ACME does not allow '**.' wildcard domain",
+			expectedDomains: nil,
+		},
+		{
+			desc:            "unauthorized double wildcard as SAN",
+			domains:         types.Domain{Main: "traefik.wtf", SANs: []string{"**.traefik.wtf"}},
+			dnsChallenge:    &DNSChallenge{},
+			expectedErr:     "unable to generate a wildcard certificate in ACME provider for domains \"traefik.wtf,**.traefik.wtf\" : ACME does not allow '**.' wildcard domain",
 			expectedDomains: nil,
 		},
 		{
@@ -247,18 +242,18 @@ func TestGetValidDomain(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			acmeProvider := Provider{Configuration: &Configuration{DNSChallenge: test.dnsChallenge}}
 
-			domains, err := acmeProvider.getValidDomains(context.Background(), test.domains)
+			domains, err := acmeProvider.sanitizeDomains(t.Context(), test.domains)
 
 			if len(test.expectedErr) > 0 {
 				assert.EqualError(t, err, test.expectedErr, "Unexpected error.")
 			} else {
-				assert.Equal(t, len(test.expectedDomains), len(domains), "Unexpected domains.")
+				assert.NoError(t, err)
+				assert.Equal(t, test.expectedDomains, domains, "Unexpected domains.")
 			}
 		})
 	}
@@ -429,11 +424,10 @@ func TestDeleteUnnecessaryDomains(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			domains := deleteUnnecessaryDomains(context.Background(), test.domains)
+			domains := deleteUnnecessaryDomains(t.Context(), test.domains)
 			assert.Equal(t, test.expectedDomains, domains, "unexpected domain")
 		})
 	}
@@ -503,11 +497,10 @@ func TestIsAccountMatchingCaServer(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			result := isAccountMatchingCaServer(context.Background(), test.accountURI, test.serverURI)
+			result := isAccountMatchingCaServer(t.Context(), test.accountURI, test.serverURI)
 
 			assert.Equal(t, test.expected, result)
 		})
@@ -525,12 +518,10 @@ func TestInitAccount(t *testing.T) {
 		{
 			desc: "Existing account with all information",
 			account: &Account{
-				Email:   "foo@foo.net",
-				KeyType: certcrypto.EC256,
+				Email: "foo@foo.net",
 			},
 			expectedAccount: &Account{
-				Email:   "foo@foo.net",
-				KeyType: certcrypto.EC256,
+				Email: "foo@foo.net",
 			},
 		},
 		{
@@ -538,20 +529,16 @@ func TestInitAccount(t *testing.T) {
 			email:   "foo@foo.net",
 			keyType: "EC256",
 			expectedAccount: &Account{
-				Email:   "foo@foo.net",
-				KeyType: certcrypto.EC256,
+				Email: "foo@foo.net",
 			},
 		},
 		{
-			desc: "Existing account with no email",
-			account: &Account{
-				KeyType: certcrypto.RSA4096,
-			},
+			desc:    "Existing account with no email",
+			account: &Account{},
 			email:   "foo@foo.net",
-			keyType: "EC256",
+			keyType: "4096",
 			expectedAccount: &Account{
-				Email:   "foo@foo.net",
-				KeyType: certcrypto.EC256,
+				Email: "foo@foo.net",
 			},
 		},
 		{
@@ -562,8 +549,7 @@ func TestInitAccount(t *testing.T) {
 			email:   "bar@foo.net",
 			keyType: "EC256",
 			expectedAccount: &Account{
-				Email:   "foo@foo.net",
-				KeyType: certcrypto.EC256,
+				Email: "foo@foo.net",
 			},
 		},
 		{
@@ -573,22 +559,92 @@ func TestInitAccount(t *testing.T) {
 			},
 			email: "bar@foo.net",
 			expectedAccount: &Account{
-				Email:   "foo@foo.net",
-				KeyType: certcrypto.RSA4096,
+				Email: "foo@foo.net",
 			},
 		},
 	}
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			acmeProvider := Provider{account: test.account, Configuration: &Configuration{Email: test.email, KeyType: test.keyType}}
 
-			actualAccount, err := acmeProvider.initAccount(context.Background())
-			assert.Nil(t, err, "Init account in error")
+			actualAccount, err := acmeProvider.initAccount()
+			assert.NoError(t, err, "Init account in error")
 			assert.Equal(t, test.expectedAccount.Email, actualAccount.Email, "unexpected email account")
-			assert.Equal(t, test.expectedAccount.KeyType, actualAccount.KeyType, "unexpected keyType account")
+		})
+	}
+}
+
+func Test_getCertificateRenewDurations(t *testing.T) {
+	testCases := []struct {
+		desc                  string
+		certificatesDurations int
+		expectRenewPeriod     time.Duration
+		expectRenewInterval   time.Duration
+	}{
+		{
+			desc:                  "Less than 24 Hours certificates: 20 minutes renew period, 1 minutes renew interval",
+			certificatesDurations: 1,
+			expectRenewPeriod:     time.Minute * 20,
+			expectRenewInterval:   time.Minute,
+		},
+		{
+			desc:                  "1 Year certificates: 4 months renew period, 1 week renew interval",
+			certificatesDurations: 24 * 365,
+			expectRenewPeriod:     time.Hour * 24 * 30 * 4,
+			expectRenewInterval:   time.Hour * 24 * 7,
+		},
+		{
+			desc:                  "265 Days certificates: 30 days renew period, 1 day renew interval",
+			certificatesDurations: 24 * 265,
+			expectRenewPeriod:     time.Hour * 24 * 30,
+			expectRenewInterval:   time.Hour * 24,
+		},
+		{
+			desc:                  "90 Days certificates: 30 days renew period, 1 day renew interval",
+			certificatesDurations: 24 * 90,
+			expectRenewPeriod:     time.Hour * 24 * 30,
+			expectRenewInterval:   time.Hour * 24,
+		},
+		{
+			desc:                  "45 Days certificates (Let's Encrypt 2028 standard): 10 days renew period, 12 hour renew interval",
+			certificatesDurations: 24 * 45,
+			expectRenewPeriod:     time.Hour * 24 * 10,
+			expectRenewInterval:   time.Hour * 12,
+		},
+		{
+			desc:                  "30 Days certificates: 10 days renew period, 12 hour renew interval",
+			certificatesDurations: 24 * 30,
+			expectRenewPeriod:     time.Hour * 24 * 10,
+			expectRenewInterval:   time.Hour * 12,
+		},
+		{
+			desc:                  "7 Days certificates: 2 days renew period, 2 hour renew interval",
+			certificatesDurations: 24 * 7,
+			expectRenewPeriod:     time.Hour * 24 * 2,
+			expectRenewInterval:   time.Hour * 2,
+		},
+		{
+			desc:                  "160 hour certificate (Let's Encrypt 'shortlived' profile): 2 days renew period, 2 hour renew interval",
+			certificatesDurations: 160,
+			expectRenewPeriod:     time.Hour * 24 * 2,
+			expectRenewInterval:   time.Hour * 2,
+		},
+		{
+			desc:                  "24 Hours certificates: 6 hours renew period, 10 minutes renew interval",
+			certificatesDurations: 24,
+			expectRenewPeriod:     time.Hour * 6,
+			expectRenewInterval:   time.Minute * 10,
+		},
+	}
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			renewPeriod, renewInterval := getCertificateRenewDurations(test.certificatesDurations)
+			assert.Equal(t, test.expectRenewPeriod, renewPeriod)
+			assert.Equal(t, test.expectRenewInterval, renewInterval)
 		})
 	}
 }

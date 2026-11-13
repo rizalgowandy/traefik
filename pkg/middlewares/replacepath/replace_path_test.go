@@ -1,14 +1,13 @@
 package replacepath
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 )
 
 func TestReplacePath(t *testing.T) {
@@ -60,6 +59,16 @@ func TestReplacePath(t *testing.T) {
 			expectedRawPath: "/foo%2Fbar",
 			expectedHeader:  "/path",
 		},
+		{
+			desc: "replacement with percent encoded backspace char",
+			path: "/path/%08bar",
+			config: dynamic.ReplacePath{
+				Path: "/path/%08bar",
+			},
+			expectedPath:    "/path/\bbar",
+			expectedRawPath: "/path/%08bar",
+			expectedHeader:  "/path/%08bar",
+		},
 	}
 
 	for _, test := range testCases {
@@ -72,7 +81,7 @@ func TestReplacePath(t *testing.T) {
 				requestURI = r.RequestURI
 			})
 
-			handler, err := New(context.Background(), next, test.config, "foo-replace-path")
+			handler, err := New(t.Context(), next, test.config, "foo-replace-path")
 			require.NoError(t, err)
 
 			server := httptest.NewServer(handler)

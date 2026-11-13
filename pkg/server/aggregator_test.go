@@ -1,12 +1,15 @@
 package server
 
 import (
+	"slices"
 	"testing"
 
-	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
+	"github.com/go-acme/lego/v5/challenge/tlsalpn01"
 	"github.com/stretchr/testify/assert"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/tls"
+	"github.com/stretchr/testify/require"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	otypes "github.com/traefik/traefik/v3/pkg/observability/types"
+	"github.com/traefik/traefik/v3/pkg/tls"
 )
 
 func Test_mergeConfiguration(t *testing.T) {
@@ -113,7 +116,6 @@ func Test_mergeConfiguration(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -148,21 +150,22 @@ func Test_mergeConfiguration_tlsCertificates(t *testing.T) {
 				"tlsalpn.acme": &dynamic.Configuration{
 					TLS: &dynamic.TLSConfiguration{
 						Certificates: []*tls.CertAndStores{{
-							Certificate: tls.Certificate{CertFile: "foo", KeyFile: "bar"},
-							Stores:      []string{tlsalpn01.ACMETLS1Protocol},
+							CertFile: "foo",
+							KeyFile:  "bar",
+							Stores:   []string{tlsalpn01.ACMETLS1Protocol},
 						}},
 					},
 				},
 			},
 			expected: []*tls.CertAndStores{{
-				Certificate: tls.Certificate{CertFile: "foo", KeyFile: "bar"},
-				Stores:      []string{tlsalpn01.ACMETLS1Protocol},
+				CertFile: "foo",
+				KeyFile:  "bar",
+				Stores:   []string{tlsalpn01.ACMETLS1Protocol},
 			}},
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -182,13 +185,7 @@ func Test_mergeConfiguration_tlsOptions(t *testing.T) {
 			desc:  "Nil returns an empty configuration",
 			given: nil,
 			expected: map[string]tls.Options{
-				"default": {
-					ALPNProtocols: []string{
-						"h2",
-						"http/1.1",
-						"acme-tls/1",
-					},
-				},
+				"default": tls.DefaultTLSOptions,
 			},
 		},
 		{
@@ -205,13 +202,7 @@ func Test_mergeConfiguration_tlsOptions(t *testing.T) {
 				},
 			},
 			expected: map[string]tls.Options{
-				"default": {
-					ALPNProtocols: []string{
-						"h2",
-						"http/1.1",
-						"acme-tls/1",
-					},
-				},
+				"default": tls.DefaultTLSOptions,
 				"foo@provider-1": {
 					MinVersion: "VersionTLS12",
 				},
@@ -240,13 +231,7 @@ func Test_mergeConfiguration_tlsOptions(t *testing.T) {
 				},
 			},
 			expected: map[string]tls.Options{
-				"default": {
-					ALPNProtocols: []string{
-						"h2",
-						"http/1.1",
-						"acme-tls/1",
-					},
-				},
+				"default": tls.DefaultTLSOptions,
 				"foo@provider-1": {
 					MinVersion: "VersionTLS13",
 				},
@@ -352,13 +337,7 @@ func Test_mergeConfiguration_tlsOptions(t *testing.T) {
 				},
 			},
 			expected: map[string]tls.Options{
-				"default": {
-					ALPNProtocols: []string{
-						"h2",
-						"http/1.1",
-						"acme-tls/1",
-					},
-				},
+				"default": tls.DefaultTLSOptions,
 				"foo@provider-1": {
 					MinVersion: "VersionTLS12",
 				},
@@ -370,8 +349,6 @@ func Test_mergeConfiguration_tlsOptions(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
-
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -463,7 +440,6 @@ func Test_mergeConfiguration_tlsStore(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -497,6 +473,8 @@ func Test_mergeConfiguration_defaultTCPEntryPoint(t *testing.T) {
 		Services: map[string]*dynamic.TCPService{
 			"service-1@provider-1": {},
 		},
+		Models:            map[string]*dynamic.TCPModel{},
+		ServersTransports: make(map[string]*dynamic.TCPServersTransport),
 	}
 
 	actual := mergeConfiguration(given, []string{"defaultEP"})
@@ -527,6 +505,34 @@ func Test_applyModel(t *testing.T) {
 			expected: dynamic.Configuration{
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers:     make(map[string]*dynamic.Router),
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models:      make(map[string]*dynamic.Model),
+				},
+			},
+		},
+		{
+			desc: "without model, one router",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:     map[string]*dynamic.Router{"test": {}},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models:      make(map[string]*dynamic.Model),
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"test": {
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+					},
 					Middlewares: make(map[string]*dynamic.Middleware),
 					Services:    make(map[string]*dynamic.Service),
 					Models:      make(map[string]*dynamic.Model),
@@ -588,6 +594,12 @@ func Test_applyModel(t *testing.T) {
 							EntryPoints: []string{"websecure"},
 							Middlewares: []string{"test"},
 							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
 						},
 					},
 					Middlewares: make(map[string]*dynamic.Middleware),
@@ -596,6 +608,63 @@ func Test_applyModel(t *testing.T) {
 						"websecure@internal": {
 							Middlewares: []string{"test"},
 							TLS:         &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "with model, one entry point with observability",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"test": {
+							EntryPoints: []string{"websecure"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							Middlewares: []string{"test"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Tracing:        new(true),
+								Metrics:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"test": {
+							EntryPoints: []string{"websecure"},
+							Middlewares: []string{"test"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Tracing:        new(true),
+								Metrics:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							Middlewares: []string{"test"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Tracing:        new(true),
+								Metrics:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
 						},
 					},
 				},
@@ -628,6 +697,12 @@ func Test_applyModel(t *testing.T) {
 							EntryPoints: []string{"websecure"},
 							Middlewares: []string{"test"},
 							TLS:         &dynamic.RouterTLSConfig{CertResolver: "router"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
 						},
 					},
 					Middlewares: make(map[string]*dynamic.Middleware),
@@ -665,11 +740,23 @@ func Test_applyModel(t *testing.T) {
 					Routers: map[string]*dynamic.Router{
 						"test": {
 							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
 						},
 						"websecure-test": {
 							EntryPoints: []string{"websecure"},
 							Middlewares: []string{"test"},
 							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
 						},
 					},
 					Middlewares: make(map[string]*dynamic.Middleware),
@@ -683,16 +770,645 @@ func Test_applyModel(t *testing.T) {
 				},
 			},
 		},
+		{
+			desc: "with TCP model, two entry points",
+			input: dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers: map[string]*dynamic.TCPRouter{
+						"test": {
+							EntryPoints: []string{"websecure", "web"},
+						},
+						"test2": {
+							EntryPoints: []string{"web"},
+							RuleSyntax:  "barfoo",
+						},
+					},
+					Middlewares: make(map[string]*dynamic.TCPMiddleware),
+					Services:    make(map[string]*dynamic.TCPService),
+					Models: map[string]*dynamic.TCPModel{
+						"websecure@internal": {
+							DefaultRuleSyntax: "foobar",
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers: map[string]*dynamic.TCPRouter{
+						"test": {
+							EntryPoints: []string{"websecure", "web"},
+							RuleSyntax:  "foobar",
+						},
+						"test2": {
+							EntryPoints: []string{"web"},
+							RuleSyntax:  "barfoo",
+						},
+					},
+					Middlewares: make(map[string]*dynamic.TCPMiddleware),
+					Services:    make(map[string]*dynamic.TCPService),
+					Models: map[string]*dynamic.TCPModel{
+						"websecure@internal": {
+							DefaultRuleSyntax: "foobar",
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "child router with parentRefs, parent not split",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"web"},
+						},
+						"child": {
+							ParentRefs: []string{"parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models:      make(map[string]*dynamic.Model),
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"child": {
+							ParentRefs: []string{"parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models:      make(map[string]*dynamic.Model),
+				},
+			},
+		},
+		{
+			desc: "child router with parentRefs, parent split by model",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"websecure", "web"},
+						},
+						"child": {
+							ParentRefs: []string{"parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							Middlewares: []string{"test"},
+							TLS:         &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"websecure-parent": {
+							EntryPoints: []string{"websecure"},
+							Middlewares: []string{"test"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"child": {
+							ParentRefs: []string{"parent", "websecure-parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							Middlewares: []string{"test"},
+							TLS:         &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "multiple child routers with parentRefs, parent split by model",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"websecure", "web"},
+						},
+						"child1": {
+							ParentRefs: []string{"parent"},
+						},
+						"child2": {
+							ParentRefs: []string{"parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							Middlewares: []string{"auth"},
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"websecure-parent": {
+							EntryPoints: []string{"websecure"},
+							Middlewares: []string{"auth"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"child1": {
+							ParentRefs: []string{"parent", "websecure-parent"},
+						},
+						"child2": {
+							ParentRefs: []string{"parent", "websecure-parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							Middlewares: []string{"auth"},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "child router with parentRefs to non-existing parent",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"child": {
+							ParentRefs: []string{"nonexistent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models:      make(map[string]*dynamic.Model),
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"child": {
+							ParentRefs: []string{"nonexistent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models:      make(map[string]*dynamic.Model),
+				},
+			},
+		},
+		{
+			desc: "child router with multiple parentRefs, some split",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent1": {
+							EntryPoints: []string{"websecure", "web"},
+						},
+						"parent2": {
+							EntryPoints: []string{"web"},
+						},
+						"child": {
+							ParentRefs: []string{"parent1", "parent2"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent1": {
+							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"websecure-parent1": {
+							EntryPoints: []string{"websecure"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"parent2": {
+							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"child": {
+							ParentRefs: []string{"parent1", "websecure-parent1", "parent2"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "child router with multiple parentRefs, all split",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent1": {
+							EntryPoints: []string{"websecure", "web"},
+						},
+						"parent2": {
+							EntryPoints: []string{"web"},
+						},
+						"child": {
+							ParentRefs: []string{"parent1", "parent2"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"web@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+						"websecure@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"web-parent1": {
+							EntryPoints: []string{"web"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"websecure-parent1": {
+							EntryPoints: []string{"websecure"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"parent2": {
+							EntryPoints: []string{"web"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"child": {
+							ParentRefs: []string{"websecure-parent1", "web-parent1", "parent2"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"web@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+						"websecure@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "child router with parentRefs, parent split into three routers",
+			input: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"websecure", "web", "admin"},
+						},
+						"child": {
+							ParentRefs: []string{"parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+						"admin@internal": {
+							Middlewares: []string{"admin-auth"},
+						},
+					},
+				},
+			},
+			expected: dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"parent": {
+							EntryPoints: []string{"web"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"websecure-parent": {
+							EntryPoints: []string{"websecure"},
+							TLS:         &dynamic.RouterTLSConfig{},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"admin-parent": {
+							EntryPoints: []string{"admin"},
+							Middlewares: []string{"admin-auth"},
+							Observability: &dynamic.RouterObservabilityConfig{
+								AccessLogs:     new(true),
+								Metrics:        new(true),
+								Tracing:        new(true),
+								TraceVerbosity: otypes.MinimalVerbosity,
+							},
+						},
+						"child": {
+							ParentRefs: []string{"parent", "websecure-parent", "admin-parent"},
+						},
+					},
+					Middlewares: make(map[string]*dynamic.Middleware),
+					Services:    make(map[string]*dynamic.Service),
+					Models: map[string]*dynamic.Model{
+						"websecure@internal": {
+							TLS: &dynamic.RouterTLSConfig{},
+						},
+						"admin@internal": {
+							Middlewares: []string{"admin-auth"},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			actual := applyModel(test.input)
 
 			assert.Equal(t, test.expected, actual)
+		})
+	}
+}
+
+func Test_resolveHTTPTLSOptions(t *testing.T) {
+	testCases := []struct {
+		desc              string
+		strictTLSOptions  bool
+		routers           map[string]*dynamic.Router
+		expected          map[string]string // router name -> ResolvedOptions
+		conflicting       []string          // router names expected to be flagged as conflicting
+		unexpectedRouters []string
+	}{
+		{
+			desc: "same host, different options, different entryPoints: no conflict",
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+				"router-b@file": {EntryPoints: []string{"ep-b"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsB"}},
+			},
+			expected: map[string]string{
+				"router-a@file": "optsA@file",
+				"router-b@file": "optsB@file",
+			},
+		},
+		{
+			desc: "same host, different options, same entryPoint: conflict falls back to default",
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+				"router-b@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsB"}},
+			},
+			expected: map[string]string{
+				"ep-a-conflicted-router-a@file": "default",
+				"ep-a-conflicted-router-b@file": "default",
+			},
+			unexpectedRouters: []string{"router-a@file", "router-b@file"},
+		},
+		{
+			desc: "same host, same options, same entryPoint: keeps the configured options",
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+				"router-b@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`) && PathPrefix(`/foo`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+			},
+			expected: map[string]string{
+				"router-a@file": "optsA@file",
+				"router-b@file": "optsA@file",
+			},
+		},
+		{
+			desc: "router spanning two entryPoints, conflict on one only: router is duplicated",
+			routers: map[string]*dynamic.Router{
+				"shared@file": {EntryPoints: []string{"ep-a", "ep-b"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsX"}},
+				"other@file":  {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsY"}},
+			},
+			expected: map[string]string{
+				"ep-a-conflicted-shared@file": "default",    // conflicts with other@file on ep-a
+				"shared@file":                 "optsX@file", // alone on ep-b
+				"ep-a-conflicted-other@file":  "default",
+			},
+			unexpectedRouters: []string{"other@file"},
+		},
+		{
+			desc: "no domain in rule, non-default options: forced to default and renamed",
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "PathPrefix(`/foo`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+			},
+			expected: map[string]string{
+				"ep-a-conflicted-router-a@file": "default",
+			},
+			unexpectedRouters: []string{"router-a@file"},
+		},
+		{
+			desc: "no domain in rule, implicit default options: not conflicting, keeps its name",
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "PathPrefix(`/foo`)", TLS: &dynamic.RouterTLSConfig{}},
+			},
+			expected: map[string]string{
+				"router-a@file": "default",
+			},
+			unexpectedRouters: []string{"ep-a-conflicted-router-a@file"},
+		},
+		{
+			desc:             "strict: same host, different options, different entryPoints: no conflict",
+			strictTLSOptions: true,
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+				"router-b@file": {EntryPoints: []string{"ep-b"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsB"}},
+			},
+			expected: map[string]string{
+				"router-a@file": "optsA@file",
+				"router-b@file": "optsB@file",
+			},
+		},
+		{
+			desc:             "strict: same host, different options, same entryPoint: conflict is not arbitrated",
+			strictTLSOptions: true,
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+				"router-b@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsB"}},
+			},
+			expected: map[string]string{
+				"ep-a-conflicted-router-a@file": "optsA@file",
+				"ep-a-conflicted-router-b@file": "optsB@file",
+			},
+			conflicting:       []string{"ep-a-conflicted-router-a@file", "ep-a-conflicted-router-b@file"},
+			unexpectedRouters: []string{"router-a@file", "router-b@file"},
+		},
+		{
+			desc:             "strict: router spanning two entryPoints, conflict on one only: router is duplicated",
+			strictTLSOptions: true,
+			routers: map[string]*dynamic.Router{
+				"shared@file": {EntryPoints: []string{"ep-a", "ep-b"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsX"}},
+				"other@file":  {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsY"}},
+			},
+			expected: map[string]string{
+				"ep-a-conflicted-shared@file": "optsX@file",
+				"shared@file":                 "optsX@file", // alone on ep-b
+				"ep-a-conflicted-other@file":  "optsY@file",
+			},
+			conflicting:       []string{"ep-a-conflicted-shared@file", "ep-a-conflicted-other@file"},
+			unexpectedRouters: []string{"other@file"},
+		},
+		{
+			desc:             "strict: no domain in rule, non-default options: flagged as conflicting",
+			strictTLSOptions: true,
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "PathPrefix(`/foo`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+			},
+			expected: map[string]string{
+				"ep-a-conflicted-router-a@file": "optsA@file",
+			},
+			conflicting:       []string{"ep-a-conflicted-router-a@file"},
+			unexpectedRouters: []string{"router-a@file"},
+		},
+		{
+			desc:             "strict: same host, same options, same entryPoint: keeps the configured options",
+			strictTLSOptions: true,
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+				"router-b@file": {EntryPoints: []string{"ep-a"}, Rule: "Host(`example.com`) && PathPrefix(`/foo`)", TLS: &dynamic.RouterTLSConfig{Options: "optsA"}},
+			},
+			expected: map[string]string{
+				"router-a@file": "optsA@file",
+				"router-b@file": "optsA@file",
+			},
+		},
+		{
+			desc: "no domain in rule, explicit default options: not conflicting, keeps its name",
+			routers: map[string]*dynamic.Router{
+				"router-a@file": {EntryPoints: []string{"ep-a"}, Rule: "PathPrefix(`/foo`)", TLS: &dynamic.RouterTLSConfig{
+					Options: "default",
+				}},
+			},
+			expected: map[string]string{
+				"router-a@file": "default",
+			},
+			unexpectedRouters: []string{"ep-a-conflicted-router-a@file"},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			got := resolveHTTPTLSOptions(test.routers, test.strictTLSOptions)
+
+			for name, want := range test.expected {
+				rt, ok := got[name]
+
+				require.True(t, ok, "router %q is missing", name)
+				require.NotNil(t, rt.TLS, "router %q has no TLS config", name)
+				assert.Equal(t, want, rt.TLS.ResolvedOptions, "router %q %v", name, rt.EntryPoints)
+				assert.Equal(t, slices.Contains(test.conflicting, name), rt.TLS.ConflictingOptions, "router %q", name)
+			}
+
+			for _, name := range test.unexpectedRouters {
+				_, ok := got[name]
+				require.False(t, ok, "router %q is present", name)
+			}
 		})
 	}
 }

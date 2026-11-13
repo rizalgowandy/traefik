@@ -1,19 +1,19 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/config/static"
 )
 
 func TestHandler_TCP(t *testing.T) {
@@ -194,6 +194,89 @@ func TestHandler_TCP(t *testing.T) {
 			},
 		},
 		{
+			desc: "TCP routers filtered by service",
+			path: "/api/tcp/routers?serviceName=foo-service@myprovider",
+			conf: runtime.Configuration{
+				TCPRouters: map[string]*runtime.TCPRouterInfo{
+					"test@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.bar.other`)",
+							TLS: &dynamic.RouterTCPTLSConfig{
+								Passthrough: false,
+							},
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"bar@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service",
+							Rule:        "Host(`foo.bar`)",
+						},
+						Status: runtime.StatusWarning,
+					},
+					"foo@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "bar-service@myprovider",
+							Rule:        "Host(`foo.bar`)",
+						},
+						Status: runtime.StatusDisabled,
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				nextPage:   "1",
+				jsonFile:   "testdata/tcprouters-filtered-serviceName.json",
+			},
+		},
+		{
+			desc: "TCP routers filtered by middleware",
+			path: "/api/tcp/routers?middlewareName=auth",
+			conf: runtime.Configuration{
+				TCPRouters: map[string]*runtime.TCPRouterInfo{
+					"test@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.bar.other`)",
+							Middlewares: []string{"inflightconn@myprovider"},
+							TLS: &dynamic.RouterTCPTLSConfig{
+								Passthrough: false,
+							},
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"bar@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service",
+							Rule:        "Host(`foo.bar`)",
+							Middlewares: []string{"auth", "inflightconn@myprovider"},
+						},
+						Status: runtime.StatusWarning,
+					},
+					"foo@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "bar-service@myprovider",
+							Rule:        "Host(`foo.bar`)",
+							Middlewares: []string{"inflightconn@myprovider", "auth"},
+						},
+						Status: runtime.StatusDisabled,
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				nextPage:   "1",
+				jsonFile:   "testdata/tcprouters-filtered-middlewareName.json",
+			},
+		},
+		{
 			desc: "one TCP router by id",
 			path: "/api/tcp/routers/bar@myprovider",
 			conf: runtime.Configuration{
@@ -210,6 +293,25 @@ func TestHandler_TCP(t *testing.T) {
 			expected: expected{
 				statusCode: http.StatusOK,
 				jsonFile:   "testdata/tcprouter-bar.json",
+			},
+		},
+		{
+			desc: "one TCP router by id containing slash",
+			path: "/api/tcp/routers/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				TCPRouters: map[string]*runtime.TCPRouterInfo{
+					"foo / bar@myprovider": {
+						TCPRouter: &dynamic.TCPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.bar`)",
+						},
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/tcprouter-foo-slash-bar.json",
 			},
 		},
 		{
@@ -253,45 +355,57 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/services",
 			conf: runtime.Configuration{
 				TCPServices: map[string]*runtime.TCPServiceInfo{
-					"bar@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.1:2345",
+					"bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider", "test@myprovider"},
-						Status: runtime.StatusEnabled,
-					},
-					"baz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+							Status: runtime.StatusEnabled,
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
+					"baz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.2:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-						Status: runtime.StatusWarning,
-					},
-					"foz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider"},
+							Status: runtime.StatusWarning,
+						}
+						si.UpdateServerStatus("127.0.0.2:2345", "UP")
+						return si
+					}(),
+					"foz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.3:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-						Status: runtime.StatusDisabled,
-					},
+							UsedBy: []string{"foo@myprovider"},
+							Status: runtime.StatusDisabled,
+						}
+						si.UpdateServerStatus("127.0.0.3:2345", "UP")
+						return si
+					}(),
 				},
 			},
 			expected: expected{
@@ -305,45 +419,57 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/services?status=enabled",
 			conf: runtime.Configuration{
 				TCPServices: map[string]*runtime.TCPServiceInfo{
-					"bar@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.1:2345",
+					"bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider", "test@myprovider"},
-						Status: runtime.StatusEnabled,
-					},
-					"baz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+							Status: runtime.StatusEnabled,
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
+					"baz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.2:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-						Status: runtime.StatusWarning,
-					},
-					"foz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider"},
+							Status: runtime.StatusWarning,
+						}
+						si.UpdateServerStatus("127.0.0.2:2345", "UP")
+						return si
+					}(),
+					"foz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.3:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-						Status: runtime.StatusDisabled,
-					},
+							UsedBy: []string{"foo@myprovider"},
+							Status: runtime.StatusDisabled,
+						}
+						si.UpdateServerStatus("127.0.0.3:2345", "UP")
+						return si
+					}(),
 				},
 			},
 			expected: expected{
@@ -357,45 +483,57 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/services?search=baz@my",
 			conf: runtime.Configuration{
 				TCPServices: map[string]*runtime.TCPServiceInfo{
-					"bar@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.1:2345",
+					"bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider", "test@myprovider"},
-						Status: runtime.StatusEnabled,
-					},
-					"baz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+							Status: runtime.StatusEnabled,
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
+					"baz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.2:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-						Status: runtime.StatusWarning,
-					},
-					"foz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider"},
+							Status: runtime.StatusWarning,
+						}
+						si.UpdateServerStatus("127.0.0.2:2345", "UP")
+						return si
+					}(),
+					"foz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.3:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-						Status: runtime.StatusDisabled,
-					},
+							UsedBy: []string{"foo@myprovider"},
+							Status: runtime.StatusDisabled,
+						}
+						si.UpdateServerStatus("127.0.0.3:2345", "UP")
+						return si
+					}(),
 				},
 			},
 			expected: expected{
@@ -409,41 +547,53 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/services?page=2&per_page=1",
 			conf: runtime.Configuration{
 				TCPServices: map[string]*runtime.TCPServiceInfo{
-					"bar@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.1:2345",
+					"bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider", "test@myprovider"},
-					},
-					"baz@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.2:2345",
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
+					"baz@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.2:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider"},
-					},
-					"test@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.3:2345",
+							UsedBy: []string{"foo@myprovider"},
+						}
+						si.UpdateServerStatus("127.0.0.2:2345", "UP")
+						return si
+					}(),
+					"test@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.3:2345",
+										},
 									},
 								},
 							},
-						},
-					},
+						}
+						si.UpdateServerStatus("127.0.0.3:2345", "UP")
+						return si
+					}(),
 				},
 			},
 			expected: expected{
@@ -457,18 +607,22 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/services/bar@myprovider",
 			conf: runtime.Configuration{
 				TCPServices: map[string]*runtime.TCPServiceInfo{
-					"bar@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.1:2345",
+					"bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider", "test@myprovider"},
-					},
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
 				},
 			},
 			expected: expected{
@@ -477,22 +631,54 @@ func TestHandler_TCP(t *testing.T) {
 			},
 		},
 		{
+			desc: "one tcp service by id containing slash",
+			path: "/api/tcp/services/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				TCPServices: map[string]*runtime.TCPServiceInfo{
+					"foo / bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
+									},
+								},
+							},
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/tcpservice-foo-slash-bar.json",
+			},
+		},
+		{
 			desc: "one tcp service by id, that does not exist",
 			path: "/api/tcp/services/nono@myprovider",
 			conf: runtime.Configuration{
 				TCPServices: map[string]*runtime.TCPServiceInfo{
-					"bar@myprovider": {
-						TCPService: &dynamic.TCPService{
-							LoadBalancer: &dynamic.TCPServersLoadBalancer{
-								Servers: []dynamic.TCPServer{
-									{
-										Address: "127.0.0.1:2345",
+					"bar@myprovider": func() *runtime.TCPServiceInfo {
+						si := &runtime.TCPServiceInfo{
+							TCPService: &dynamic.TCPService{
+								LoadBalancer: &dynamic.TCPServersLoadBalancer{
+									Servers: []dynamic.TCPServer{
+										{
+											Address: "127.0.0.1:2345",
+										},
 									},
 								},
 							},
-						},
-						UsedBy: []string{"foo@myprovider", "test@myprovider"},
-					},
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+						}
+						si.UpdateServerStatus("127.0.0.1:2345", "UP")
+						return si
+					}(),
 				},
 			},
 			expected: expected{
@@ -512,25 +698,25 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/middlewares",
 			conf: runtime.Configuration{
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
-					"ipwhitelist1@myprovider": {
+					"ipallowlist1@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						UsedBy: []string{"bar@myprovider", "test@myprovider"},
 					},
-					"ipwhitelist2@myprovider": {
+					"ipallowlist2@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.2/32"},
 							},
 						},
 						UsedBy: []string{"test@myprovider"},
 					},
-					"ipwhitelist1@anotherprovider": {
+					"ipallowlist1@anotherprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -549,27 +735,27 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/middlewares?status=enabled",
 			conf: runtime.Configuration{
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
-					"ipwhitelist@myprovider": {
+					"ipallowlist@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						UsedBy: []string{"bar@myprovider", "test@myprovider"},
 						Status: runtime.StatusEnabled,
 					},
-					"ipwhitelist2@myprovider": {
+					"ipallowlist2@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.2/32"},
 							},
 						},
 						UsedBy: []string{"test@myprovider"},
 						Status: runtime.StatusDisabled,
 					},
-					"ipwhitelist@anotherprovider": {
+					"ipallowlist@anotherprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -586,30 +772,30 @@ func TestHandler_TCP(t *testing.T) {
 		},
 		{
 			desc: "middlewares filtered by search",
-			path: "/api/tcp/middlewares?search=ipwhitelist",
+			path: "/api/tcp/middlewares?search=ipallowlist",
 			conf: runtime.Configuration{
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
 					"bad@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						UsedBy: []string{"bar@myprovider", "test@myprovider"},
 						Status: runtime.StatusEnabled,
 					},
-					"ipwhitelist@myprovider": {
+					"ipallowlist@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						UsedBy: []string{"test@myprovider"},
 						Status: runtime.StatusDisabled,
 					},
-					"ipwhitelist@anotherprovider": {
+					"ipallowlist@anotherprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -629,25 +815,25 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/middlewares?page=2&per_page=1",
 			conf: runtime.Configuration{
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
-					"ipwhitelist@myprovider": {
+					"ipallowlist@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						UsedBy: []string{"bar@myprovider", "test@myprovider"},
 					},
-					"ipwhitelist2@myprovider": {
+					"ipallowlist2@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.2/32"},
 							},
 						},
 						UsedBy: []string{"test@myprovider"},
 					},
-					"ipwhitelist@anotherprovider": {
+					"ipallowlist@anotherprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -663,28 +849,28 @@ func TestHandler_TCP(t *testing.T) {
 		},
 		{
 			desc: "one middleware by id",
-			path: "/api/tcp/middlewares/ipwhitelist@myprovider",
+			path: "/api/tcp/middlewares/ipallowlist@myprovider",
 			conf: runtime.Configuration{
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
-					"ipwhitelist@myprovider": {
+					"ipallowlist@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
 						UsedBy: []string{"bar@myprovider", "test@myprovider"},
 					},
-					"ipwhitelist2@myprovider": {
+					"ipallowlist2@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.2/32"},
 							},
 						},
 						UsedBy: []string{"test@myprovider"},
 					},
-					"ipwhitelist@anotherprovider": {
+					"ipallowlist@anotherprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -694,7 +880,27 @@ func TestHandler_TCP(t *testing.T) {
 			},
 			expected: expected{
 				statusCode: http.StatusOK,
-				jsonFile:   "testdata/tcpmiddleware-ipwhitelist.json",
+				jsonFile:   "testdata/tcpmiddleware-ipallowlist.json",
+			},
+		},
+		{
+			desc: "one middleware by id containing slash",
+			path: "/api/tcp/middlewares/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
+					"foo / bar@myprovider": {
+						TCPMiddleware: &dynamic.TCPMiddleware{
+							IPWhiteList: &dynamic.TCPIPWhiteList{
+								SourceRange: []string{"127.0.0.1/32"},
+							},
+						},
+						UsedBy: []string{"bar@myprovider", "test@myprovider"},
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/tcpmiddleware-foo-slash-bar.json",
 			},
 		},
 		{
@@ -702,9 +908,9 @@ func TestHandler_TCP(t *testing.T) {
 			path: "/api/tcp/middlewares/foo@myprovider",
 			conf: runtime.Configuration{
 				TCPMiddlewares: map[string]*runtime.TCPMiddlewareInfo{
-					"ipwhitelist@myprovider": {
+					"ipallowlist@myprovider": {
 						TCPMiddleware: &dynamic.TCPMiddleware{
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"127.0.0.1/32"},
 							},
 						},
@@ -727,14 +933,13 @@ func TestHandler_TCP(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			rtConf := &test.conf
 			// To lazily initialize the Statuses.
 			rtConf.PopulateUsedBy()
-			rtConf.GetTCPRoutersByEntryPoints(context.Background(), []string{"web"})
+			rtConf.GetTCPRoutersByEntryPoints(t.Context(), []string{"web"})
 
 			handler := New(static.Configuration{API: &static.API{}, Global: &static.Global{}}, rtConf)
 			server := httptest.NewServer(handler.createRouter())
@@ -750,7 +955,7 @@ func TestHandler_TCP(t *testing.T) {
 				return
 			}
 
-			assert.Equal(t, resp.Header.Get("Content-Type"), "application/json")
+			assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 
 			contents, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
@@ -759,7 +964,7 @@ func TestHandler_TCP(t *testing.T) {
 			require.NoError(t, err)
 
 			if *updateExpected {
-				var results interface{}
+				var results any
 				err := json.Unmarshal(contents, &results)
 				require.NoError(t, err)
 

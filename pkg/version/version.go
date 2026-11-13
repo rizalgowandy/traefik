@@ -3,13 +3,12 @@ package version
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"time"
 
-	"github.com/google/go-github/v28/github"
+	"github.com/google/go-github/v90/github"
 	"github.com/gorilla/mux"
 	goversion "github.com/hashicorp/go-version"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
 	"github.com/unrolled/render"
 )
 
@@ -22,10 +21,10 @@ var (
 	BuildDate = "I don't remember exactly"
 	// StartDate holds the start date of traefik.
 	StartDate = time.Now()
-	// UUID instance uuid.
-	UUID string
-	// PilotEnabled activate integration of pilot into the dashboard.
-	PilotEnabled bool
+	// DisableDashboardAd disables ad in the dashboard.
+	DisableDashboardAd = false
+	// DashboardName holds the custom name for the dashboard.
+	DashboardName = ""
 )
 
 // Handler expose version routes.
@@ -40,21 +39,22 @@ func (v Handler) Append(router *mux.Router) {
 	router.Methods(http.MethodGet).Path("/api/version").
 		HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 			v := struct {
-				Version      string
-				Codename     string
-				StartDate    time.Time `json:"startDate"`
-				UUID         string    `json:"uuid,omitempty"`
-				PilotEnabled bool      `json:"pilotEnabled"`
+				Version            string
+				Codename           string
+				StartDate          time.Time `json:"startDate"`
+				UUID               string    `json:"uuid,omitempty"`
+				DisableDashboardAd bool      `json:"disableDashboardAd,omitempty"`
+				DashboardName      string    `json:"dashboardName,omitempty"`
 			}{
-				Version:      Version,
-				Codename:     Codename,
-				StartDate:    StartDate,
-				UUID:         UUID,
-				PilotEnabled: PilotEnabled,
+				Version:            Version,
+				Codename:           Codename,
+				StartDate:          StartDate,
+				DisableDashboardAd: DisableDashboardAd,
+				DashboardName:      DashboardName,
 			}
 
 			if err := templatesRenderer.JSON(response, http.StatusOK, v); err != nil {
-				log.WithoutContext().Error(err)
+				log.Error().Err(err).Send()
 			}
 		})
 }
@@ -65,38 +65,35 @@ func CheckNewVersion() {
 		return
 	}
 
-	logger := log.WithoutContext()
+	updateURL := "https://update.traefik.io/"
 
-	client := github.NewClient(nil)
-
-	updateURL, err := url.Parse("https://update.traefik.io/")
+	client, err := github.NewClient(github.WithURLs(&updateURL, nil))
 	if err != nil {
-		logger.Warnf("Error checking new version: %s", err)
+		log.Warn().Err(err).Msg("Error checking new version")
 		return
 	}
-	client.BaseURL = updateURL
 
 	releases, resp, err := client.Repositories.ListReleases(context.Background(), "traefik", "traefik", nil)
 	if err != nil {
-		logger.Warnf("Error checking new version: %s", err)
+		log.Warn().Err(err).Msg("Error checking new version")
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		logger.Warnf("Error checking new version: status=%s", resp.Status)
+		log.Warn().Msgf("Error checking new version: status=%s", resp.Status)
 		return
 	}
 
 	currentVersion, err := goversion.NewVersion(Version)
 	if err != nil {
-		logger.Warnf("Error checking new version: %s", err)
+		log.Warn().Err(err).Msg("Error checking new version")
 		return
 	}
 
 	for _, release := range releases {
-		releaseVersion, err := goversion.NewVersion(*release.TagName)
+		releaseVersion, err := goversion.NewVersion(release.TagName)
 		if err != nil {
-			logger.Warnf("Error checking new version: %s", err)
+			log.Warn().Err(err).Msg("Error checking new version")
 			return
 		}
 
@@ -105,7 +102,7 @@ func CheckNewVersion() {
 		}
 
 		if releaseVersion.GreaterThan(currentVersion) {
-			logger.Warnf("A new release has been found: %s. Please consider updating.", releaseVersion.String())
+			log.Warn().Err(err).Msgf("A new release of Traefik has been found: %s. Please consider updating.", releaseVersion.String())
 			return
 		}
 	}

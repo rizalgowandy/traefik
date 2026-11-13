@@ -2,25 +2,41 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	ptypes "github.com/traefik/paerser/types"
-	"github.com/traefik/traefik/v2/pkg/config/static"
-	"github.com/traefik/traefik/v2/pkg/tcp"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/middlewares/requestdecorator"
+	"github.com/traefik/traefik/v3/pkg/proxy/fast"
+	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
+	"github.com/traefik/traefik/v3/pkg/server/service"
+	"github.com/traefik/traefik/v3/pkg/tcp"
+	"github.com/traefik/traefik/v3/pkg/tls/generate"
+	"golang.org/x/net/http2"
 )
 
 func TestShutdownHijacked(t *testing.T) {
-	router := &tcp.Router{}
-	router.HTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		conn, _, err := rw.(http.Hijacker).Hijack()
 		require.NoError(t, err)
 
@@ -33,8 +49,10 @@ func TestShutdownHijacked(t *testing.T) {
 }
 
 func TestShutdownHTTP(t *testing.T) {
-	router := &tcp.Router{}
-	router.HTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 		time.Sleep(time.Second)
 	}))
@@ -43,26 +61,24 @@ func TestShutdownHTTP(t *testing.T) {
 }
 
 func TestShutdownTCP(t *testing.T) {
-	router := &tcp.Router{}
-	router.AddCatchAllNoTLS(tcp.HandlerFunc(func(conn tcp.WriteCloser) {
-		for {
-			_, err := http.ReadRequest(bufio.NewReader(conn))
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
 
-			if errors.Is(err, io.EOF) || (err != nil && errors.Is(err, net.ErrClosed)) {
-				return
-			}
-			require.NoError(t, err)
-
-			resp := http.Response{StatusCode: http.StatusOK}
-			err = resp.Write(conn)
-			require.NoError(t, err)
+	err = router.AddTCPRoute("HostSNI(`*`)", 0, "", tcp.HandlerFunc(func(conn tcp.WriteCloser) {
+		_, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
 		}
+
+		resp := http.Response{StatusCode: http.StatusOK}
+		_ = resp.Write(conn)
 	}))
+	require.NoError(t, err)
 
 	testShutdown(t, router)
 }
 
-func testShutdown(t *testing.T, router *tcp.Router) {
+func testShutdown(t *testing.T, router *tcprouter.Router) {
 	t.Helper()
 
 	epConfig := &static.EntryPointsTransport{}
@@ -73,17 +89,19 @@ func testShutdown(t *testing.T, router *tcp.Router) {
 	epConfig.RespondingTimeouts.ReadTimeout = ptypes.Duration(5 * time.Second)
 	epConfig.RespondingTimeouts.WriteTimeout = ptypes.Duration(5 * time.Second)
 
-	entryPoint, err := NewTCPEntryPoint(context.Background(), &static.EntryPoint{
+	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
 		// We explicitly use an IPV4 address because on Alpine, with an IPV6 address
 		// there seems to be shenanigans related to properly cleaning up file descriptors
 		Address:          "127.0.0.1:0",
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
-	})
+		HTTP2:            &static.HTTP2Config{},
+	}, nil, nil)
 	require.NoError(t, err)
 
-	conn, err := startEntrypoint(entryPoint, router)
+	conn, err := startEntrypoint(t, entryPoint, router)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
 
 	epAddr := entryPoint.listener.Addr().String()
 
@@ -92,26 +110,26 @@ func testShutdown(t *testing.T, router *tcp.Router) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// We need to do a write on the conn before the shutdown to make it "exist".
+	// We need to do a write on conn before the shutdown to make it "exist".
 	// Because the connection indeed exists as far as TCP is concerned,
 	// but since we only pass it along to the HTTP server after at least one byte is peeked,
 	// the HTTP server (and hence its shutdown) does not know about the connection until that first byte peeked.
 	err = request.Write(conn)
 	require.NoError(t, err)
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, 1)
 	// Wait for first byte in response.
 	_, err = reader.Peek(1)
 	require.NoError(t, err)
 
-	go entryPoint.Shutdown(context.Background())
+	go entryPoint.Shutdown(t.Context())
 
 	// Make sure that new connections are not permitted anymore.
 	// Note that this should be true not only after Shutdown has returned,
 	// but technically also as early as the Shutdown has closed the listener,
 	// i.e. during the shutdown and before the gracetime is over.
 	var testOk bool
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		loopConn, err := net.Dial("tcp", epAddr)
 		if err == nil {
 			loopConn.Close()
@@ -135,12 +153,14 @@ func testShutdown(t *testing.T, router *tcp.Router) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
-func startEntrypoint(entryPoint *TCPEntryPoint, router *tcp.Router) (net.Conn, error) {
-	go entryPoint.Start(context.Background())
+func startEntrypoint(t *testing.T, entryPoint *TCPEntryPoint, router *tcprouter.Router) (net.Conn, error) {
+	t.Helper()
+
+	go entryPoint.Start(t.Context())
 
 	entryPoint.SwitchRouter(router)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		conn, err := net.Dial("tcp", entryPoint.listener.Addr().String())
 		if err != nil {
 			time.Sleep(100 * time.Millisecond)
@@ -158,19 +178,22 @@ func TestReadTimeoutWithoutFirstByte(t *testing.T) {
 	epConfig.SetDefaults()
 	epConfig.RespondingTimeouts.ReadTimeout = ptypes.Duration(2 * time.Second)
 
-	entryPoint, err := NewTCPEntryPoint(context.Background(), &static.EntryPoint{
+	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
 		Address:          ":0",
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
-	})
+		HTTP2:            &static.HTTP2Config{},
+	}, nil, nil)
 	require.NoError(t, err)
 
-	router := &tcp.Router{}
-	router.HTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	}))
 
-	conn, err := startEntrypoint(entryPoint, router)
+	conn, err := startEntrypoint(t, entryPoint, router)
 	require.NoError(t, err)
 
 	errChan := make(chan error)
@@ -194,19 +217,22 @@ func TestReadTimeoutWithFirstByte(t *testing.T) {
 	epConfig.SetDefaults()
 	epConfig.RespondingTimeouts.ReadTimeout = ptypes.Duration(2 * time.Second)
 
-	entryPoint, err := NewTCPEntryPoint(context.Background(), &static.EntryPoint{
+	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
 		Address:          ":0",
 		Transport:        epConfig,
 		ForwardedHeaders: &static.ForwardedHeaders{},
-	})
+		HTTP2:            &static.HTTP2Config{},
+	}, nil, nil)
 	require.NoError(t, err)
 
-	router := &tcp.Router{}
-	router.HTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	}))
 
-	conn, err := startEntrypoint(entryPoint, router)
+	conn, err := startEntrypoint(t, entryPoint, router)
 	require.NoError(t, err)
 
 	_, err = conn.Write([]byte("GET /some HTTP/1.1\r\n"))
@@ -225,5 +251,1612 @@ func TestReadTimeoutWithFirstByte(t *testing.T) {
 		require.Equal(t, io.EOF, err)
 	case <-time.Tick(5 * time.Second):
 		t.Error("Timeout while read")
+	}
+}
+
+func TestKeepAliveMaxRequests(t *testing.T) {
+	epConfig := &static.EntryPointsTransport{}
+	epConfig.SetDefaults()
+	epConfig.KeepAliveMaxRequests = 3
+
+	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
+		Address:          ":0",
+		Transport:        epConfig,
+		ForwardedHeaders: &static.ForwardedHeaders{},
+		HTTP2:            &static.HTTP2Config{},
+	}, nil, nil)
+	require.NoError(t, err)
+
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+
+	conn, err := startEntrypoint(t, entryPoint, router)
+	require.NoError(t, err)
+
+	http.DefaultClient.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return conn, nil
+		},
+	}
+
+	resp, err := http.Get("http://" + entryPoint.listener.Addr().String())
+	require.NoError(t, err)
+	require.False(t, resp.Close)
+	err = resp.Body.Close()
+	require.NoError(t, err)
+
+	resp, err = http.Get("http://" + entryPoint.listener.Addr().String())
+	require.NoError(t, err)
+	require.False(t, resp.Close)
+	err = resp.Body.Close()
+	require.NoError(t, err)
+
+	resp, err = http.Get("http://" + entryPoint.listener.Addr().String())
+	require.NoError(t, err)
+	require.True(t, resp.Close)
+	err = resp.Body.Close()
+	require.NoError(t, err)
+}
+
+func TestKeepAliveMaxTime(t *testing.T) {
+	epConfig := &static.EntryPointsTransport{}
+	epConfig.SetDefaults()
+	epConfig.KeepAliveMaxTime = ptypes.Duration(time.Millisecond)
+
+	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
+		Address:          ":0",
+		Transport:        epConfig,
+		ForwardedHeaders: &static.ForwardedHeaders{},
+		HTTP2:            &static.HTTP2Config{},
+	}, nil, nil)
+	require.NoError(t, err)
+
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+
+	conn, err := startEntrypoint(t, entryPoint, router)
+	require.NoError(t, err)
+
+	http.DefaultClient.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return conn, nil
+		},
+	}
+
+	resp, err := http.Get("http://" + entryPoint.listener.Addr().String())
+	require.NoError(t, err)
+	require.False(t, resp.Close)
+	err = resp.Body.Close()
+	require.NoError(t, err)
+
+	time.Sleep(time.Millisecond)
+
+	resp, err = http.Get("http://" + entryPoint.listener.Addr().String())
+	require.NoError(t, err)
+	require.True(t, resp.Close)
+	err = resp.Body.Close()
+	require.NoError(t, err)
+}
+
+func TestKeepAliveH2c(t *testing.T) {
+	epConfig := &static.EntryPointsTransport{}
+	epConfig.SetDefaults()
+	epConfig.KeepAliveMaxRequests = 1
+
+	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
+		Address:          ":0",
+		Transport:        epConfig,
+		ForwardedHeaders: &static.ForwardedHeaders{},
+		HTTP2:            &static.HTTP2Config{},
+	}, nil, nil)
+	require.NoError(t, err)
+
+	router, err := tcprouter.NewRouter(nil)
+	require.NoError(t, err)
+
+	router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+
+	conn, err := startEntrypoint(t, entryPoint, router)
+	require.NoError(t, err)
+
+	http2Transport := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return conn, nil
+		},
+	}
+
+	client := &http.Client{Transport: http2Transport}
+
+	resp, err := client.Get("http://" + entryPoint.listener.Addr().String())
+	require.NoError(t, err)
+	require.False(t, resp.Close)
+	err = resp.Body.Close()
+	require.NoError(t, err)
+
+	_, err = client.Get("http://" + entryPoint.listener.Addr().String())
+	require.Error(t, err)
+	// Unlike HTTP/1, where we can directly check `resp.Close`, HTTP/2 uses a different
+	// mechanism: it sends a GOAWAY frame when the connection is closing.
+	// We can only check the error type. The error received should be poll.ErrClosed from
+	// the `internal/poll` package, but we cannot directly reference the error type due to
+	// package restrictions. Since this error message ("use of closed network connection")
+	// is distinct and specific, we rely on its consistency, assuming it is stable and unlikely
+	// to change.
+	require.Contains(t, err.Error(), "use of closed network connection")
+}
+
+func Test_denyOpaque(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		wantStatus int
+	}{
+		{
+			name:       "Rejects opaque URL",
+			target:     "http:admin/secret",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "Rejects opaque URL embedding an absolute URL",
+			target:     "http:http://evil/admin/secret",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "Rejects opaque URL embedding a fragment",
+			target:     "http:#frag",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "Allows origin-form",
+			target:     "/admin/secret",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "Allows absolute-form",
+			target:     "http://example.com/admin/secret",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "Allows scheme followed by a single slash",
+			target:     "http:/admin/secret",
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := denyOpaque(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, test.target, http.NoBody)
+			res := httptest.NewRecorder()
+
+			handler.ServeHTTP(res, req)
+
+			assert.Equal(t, test.wantStatus, res.Code)
+		})
+	}
+}
+
+func Test_denyConnect(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		protoMajor int
+		wantStatus int
+	}{
+		{
+			name:       "Rejects HTTP/1 CONNECT",
+			method:     http.MethodConnect,
+			protoMajor: 1,
+			wantStatus: http.StatusNotImplemented,
+		},
+		{
+			name:       "Rejects HTTP/2 CONNECT",
+			method:     http.MethodConnect,
+			protoMajor: 2,
+			wantStatus: http.StatusNotImplemented,
+		},
+		{
+			name:       "Allows GET",
+			method:     http.MethodGet,
+			protoMajor: 1,
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := denyConnect(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(test.method, "http://example.com", nil)
+			req.ProtoMajor = test.protoMajor
+			res := httptest.NewRecorder()
+
+			handler.ServeHTTP(res, req)
+
+			assert.Equal(t, test.wantStatus, res.Code)
+		})
+	}
+}
+
+func Test_denyFragment(t *testing.T) {
+	tests := []struct {
+		name       string
+		url        string
+		wantStatus int
+	}{
+		{
+			name:       "Rejects fragment character",
+			url:        "http://example.com/#",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "Allows without fragment",
+			url:        "http://example.com/",
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := denyFragment(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, test.url, nil)
+			res := httptest.NewRecorder()
+
+			handler.ServeHTTP(res, req)
+
+			assert.Equal(t, test.wantStatus, res.Code)
+		})
+	}
+}
+
+func TestSanitizePath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{path: "/b", expected: "/b"},
+		{path: "/b/", expected: "/b/"},
+		{path: "/../../b/", expected: "/b/"},
+		{path: "/../../b", expected: "/b"},
+		{path: "/a/b/..", expected: "/a"},
+		{path: "/a/b/../", expected: "/a/"},
+		{path: "/a/../../b", expected: "/b"},
+		{path: "/..///b///", expected: "/b/"},
+		{path: "/a/../b", expected: "/b"},
+		{path: "/a/./b", expected: "/a/b"},
+		{path: "/a//b", expected: "/a/b"},
+		{path: "/a/../../b", expected: "/b"},
+		{path: "/a/../c/../b", expected: "/b"},
+		{path: "/a/../../../c/../b", expected: "/b"},
+		{path: "/a/../c/../../b", expected: "/b"},
+		{path: "/a/..//c/.././b", expected: "/b"},
+	}
+
+	for _, test := range tests {
+		t.Run("Testing case: "+test.path, func(t *testing.T) {
+			t.Parallel()
+
+			var callCount int
+			clean := sanitizePath(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callCount++
+				assert.Equal(t, test.expected, r.URL.Path)
+			}))
+
+			request := httptest.NewRequest(http.MethodGet, "http://foo"+test.path, http.NoBody)
+			clean.ServeHTTP(httptest.NewRecorder(), request)
+
+			assert.Equal(t, 1, callCount)
+		})
+	}
+}
+
+func TestAliasHeadersStrategy(t *testing.T) {
+	testCases := []struct {
+		desc               string
+		strategy           string
+		wantStatus         int
+		wantReachedBackend bool
+		wantAuthUser       []string
+		wantAliasHeaders   bool
+	}{
+		{
+			desc:               "headers are kept when strategy is not set",
+			wantStatus:         http.StatusOK,
+			wantReachedBackend: true,
+			wantAuthUser:       []string{"legit"},
+			wantAliasHeaders:   true,
+		},
+		{
+			desc:               "headers are kept with keep strategy",
+			strategy:           static.AliasHeadersStrategyKeep,
+			wantStatus:         http.StatusOK,
+			wantReachedBackend: true,
+			wantAuthUser:       []string{"legit"},
+			wantAliasHeaders:   true,
+		},
+		{
+			desc:               "aliasing headers are removed with delete strategy",
+			strategy:           static.AliasHeadersStrategyDelete,
+			wantStatus:         http.StatusOK,
+			wantReachedBackend: true,
+			wantAuthUser:       []string{"legit"},
+			wantAliasHeaders:   false,
+		},
+		{
+			desc:               "request is rejected with reject strategy",
+			strategy:           static.AliasHeadersStrategyReject,
+			wantStatus:         http.StatusBadRequest,
+			wantReachedBackend: false,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			epConfig := &static.EntryPointsTransport{}
+			epConfig.SetDefaults()
+
+			entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
+				Address:          ":0",
+				Transport:        epConfig,
+				ForwardedHeaders: &static.ForwardedHeaders{},
+				HTTP2:            &static.HTTP2Config{},
+				HTTP: static.HTTPConfig{
+					AliasHeadersStrategy: test.strategy,
+				},
+			}, nil, nil)
+			require.NoError(t, err)
+
+			router, err := tcprouter.NewRouter(nil)
+			require.NoError(t, err)
+
+			var reachedBackend bool
+			var gotHeaders http.Header
+			router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				reachedBackend = true
+				gotHeaders = req.Header.Clone()
+				rw.WriteHeader(http.StatusOK)
+			}))
+
+			conn, err := startEntrypoint(t, entryPoint, router)
+			require.NoError(t, err)
+
+			client := &http.Client{
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return conn, nil
+					},
+				},
+			}
+
+			req, err := http.NewRequest(http.MethodGet, "http://"+entryPoint.listener.Addr().String(), http.NoBody)
+			require.NoError(t, err)
+
+			req.Header.Set("X-Auth-User", "legit")
+			req.Header["X_Auth_User"] = []string{"spoof"}
+			req.Header["X.Auth.User"] = []string{"spoof"}
+
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+
+			assert.Equal(t, test.wantStatus, resp.StatusCode)
+			assert.Equal(t, test.wantReachedBackend, reachedBackend)
+
+			if !test.wantReachedBackend {
+				return
+			}
+
+			assert.Equal(t, test.wantAuthUser, gotHeaders["X-Auth-User"])
+
+			if test.wantAliasHeaders {
+				assert.Equal(t, []string{"spoof"}, gotHeaders["X_auth_user"])
+				assert.Equal(t, []string{"spoof"}, gotHeaders["X.auth.user"])
+			} else {
+				assert.NotContains(t, gotHeaders, "X_auth_user")
+				assert.NotContains(t, gotHeaders, "X.auth.user")
+			}
+		})
+	}
+}
+
+func TestNormalizePath(t *testing.T) {
+	unreservedDecoded := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	unreserved := []string{
+		"%41", "%42", "%43", "%44", "%45", "%46", "%47", "%48", "%49", "%4A", "%4B", "%4C", "%4D", "%4E", "%4F", "%50", "%51", "%52", "%53", "%54", "%55", "%56", "%57", "%58", "%59", "%5A",
+		"%61", "%62", "%63", "%64", "%65", "%66", "%67", "%68", "%69", "%6A", "%6B", "%6C", "%6D", "%6E", "%6F", "%70", "%71", "%72", "%73", "%74", "%75", "%76", "%77", "%78", "%79", "%7A",
+		"%30", "%31", "%32", "%33", "%34", "%35", "%36", "%37", "%38", "%39",
+		"%2D", "%2E", "%5F", "%7E",
+	}
+
+	reserved := []string{
+		"%3A", "%2F", "%3F", "%23", "%5B", "%5D", "%40", "%21", "%24", "%26", "%27", "%28", "%29", "%2A", "%2B", "%2C", "%3B", "%3D", "%25",
+	}
+	reservedJoined := strings.Join(reserved, "")
+
+	unallowedCharacter := "%0a"           // line feed
+	unallowedCharacterUpperCased := "%0A" // line feed upper case
+
+	var callCount int
+	handler := normalizePath(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		wantRawPath := "/" + unreservedDecoded + reservedJoined + unallowedCharacterUpperCased
+		assert.Equal(t, wantRawPath, r.URL.RawPath)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://foo/"+strings.Join(unreserved, "")+reservedJoined+unallowedCharacter, http.NoBody)
+	res := httptest.NewRecorder()
+
+	handler.ServeHTTP(res, req)
+
+	assert.Equal(t, http.StatusOK, res.Code)
+	assert.Equal(t, 1, callCount)
+}
+
+func TestNormalizePath_malformedPercentEncoding(t *testing.T) {
+	tests := []struct {
+		desc    string
+		path    string
+		wantErr bool
+	}{
+		{
+			desc: "well formed path",
+			path: "/%20",
+		},
+		{
+			desc:    "percent sign at the end",
+			path:    "/%",
+			wantErr: true,
+		},
+		{
+			desc:    "incomplete percent encoding at the end",
+			path:    "/%f",
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			var callCount int
+			handler := normalizePath(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callCount++
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://foo", http.NoBody)
+			req.URL.RawPath = test.path
+
+			res := httptest.NewRecorder()
+
+			handler.ServeHTTP(res, req)
+
+			if test.wantErr {
+				assert.Equal(t, http.StatusBadRequest, res.Code)
+				assert.Equal(t, 0, callCount)
+			} else {
+				assert.Equal(t, http.StatusOK, res.Code)
+				assert.Equal(t, 1, callCount)
+			}
+		})
+	}
+}
+
+// TestPathOperations tests the whole behavior of normalizePath, and sanitizePath combined through the use of the newHTTPServer func.
+// It aims to guarantee the server entrypoint handler is secure regarding a large variety of cases that could lead to path traversal attacks.
+func TestPathOperations(t *testing.T) {
+	// Create a listener for the server.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	// Define the server configuration.
+	configuration := &static.EntryPoint{}
+	configuration.SetDefaults()
+
+	// We need to allow some of the suspicious encoded characters to test the path operations in case they are authorized.
+	configuration.HTTP.EncodedCharacters = &static.EncodedCharacters{
+		AllowEncodedSlash:   true,
+		AllowEncodedPercent: true,
+	}
+
+	// Create the HTTP server using newHTTPServer.
+	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+	require.NoError(t, err)
+
+	server.Switcher.UpdateHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Path", r.URL.Path)
+		w.Header().Set("RawPath", r.URL.EscapedPath())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	go func() {
+		// server is expected to return an error if the listener is closed.
+		_ = server.Server.Serve(ln)
+	}()
+
+	client := http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 1 * time.Second,
+		},
+	}
+
+	tests := []struct {
+		desc           string
+		rawPath        string
+		expectedPath   string
+		expectedRaw    string
+		expectedStatus int
+	}{
+		{
+			desc:           "normalize and sanitize path",
+			rawPath:        "/a/../b/%41%42%43//%2f/",
+			expectedPath:   "/b/ABC///",
+			expectedRaw:    "/b/ABC/%2F/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with traversal attempt",
+			rawPath:        "/../../b/",
+			expectedPath:   "/b/",
+			expectedRaw:    "/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with multiple traversal attempts",
+			rawPath:        "/a/../../b/../c/",
+			expectedPath:   "/c/",
+			expectedRaw:    "/c/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with mixed traversal and valid segments",
+			rawPath:        "/a/../b/./c/../d/",
+			expectedPath:   "/b/d/",
+			expectedRaw:    "/b/d/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with trailing slash and traversal",
+			rawPath:        "/a/b/../",
+			expectedPath:   "/a/",
+			expectedRaw:    "/a/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with encoded traversal sequences",
+			rawPath:        "/a/%2E%2E/%2E%2E/b/",
+			expectedPath:   "/b/",
+			expectedRaw:    "/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with over-encoded traversal sequences",
+			rawPath:        "/a/%252E%252E/%252E%252E/b/",
+			expectedPath:   "/a/%2E%2E/%2E%2E/b/",
+			expectedRaw:    "/a/%252E%252E/%252E%252E/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "routing path with unallowed percent-encoded character",
+			rawPath:        "/foo%20bar",
+			expectedPath:   "/foo bar",
+			expectedRaw:    "/foo%20bar",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "routing path with reserved percent-encoded character",
+			rawPath:        "/foo%2Fbar",
+			expectedPath:   "/foo/bar",
+			expectedRaw:    "/foo%2Fbar",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "routing path with unallowed and reserved percent-encoded character",
+			rawPath:        "/foo%20%2Fbar",
+			expectedPath:   "/foo /bar",
+			expectedRaw:    "/foo%20%2Fbar",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with dot-segment with path parameters",
+			rawPath:        "/a/..;x/b/",
+			expectedPath:   "/b/",
+			expectedRaw:    "/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with encoded dot-segment with path parameters",
+			rawPath:        "/a/%2E%2E;x;y/b/",
+			expectedPath:   "/b/",
+			expectedRaw:    "/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with current dot-segment with path parameters",
+			rawPath:        "/a/.;x/b/",
+			expectedPath:   "/a/b/",
+			expectedRaw:    "/a/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with empty segment with path parameters",
+			rawPath:        "/a/;x/b/",
+			expectedPath:   "/a/b/",
+			expectedRaw:    "/a/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with consecutive dot-segments and empty segments with path parameters",
+			rawPath:        "/a/..;x/..;/.;y/;z/b/",
+			expectedPath:   "/b/",
+			expectedRaw:    "/b/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with dot-segment with path parameters and encoded slash",
+			rawPath:        "/a/..;x/b%2Fc/",
+			expectedPath:   "/b/c/",
+			expectedRaw:    "/b%2Fc/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with path parameters",
+			rawPath:        "/a;x/b;y=z/",
+			expectedPath:   "/a;x/b;y=z/",
+			expectedRaw:    "/a;x/b;y=z/",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			desc:           "path with traversal and encoded slash",
+			rawPath:        "/a/..%2Fb/",
+			expectedPath:   "/a/../b/",
+			expectedRaw:    "/a/..%2Fb/",
+			expectedStatus: http.StatusOK,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+test.rawPath, http.NoBody)
+			require.NoError(t, err)
+
+			res, err := client.Do(req)
+			require.NoError(t, err)
+
+			assert.Equal(t, test.expectedStatus, res.StatusCode)
+			assert.Equal(t, test.expectedPath, res.Header.Get("Path"))
+			assert.Equal(t, test.expectedRaw, res.Header.Get("RawPath"))
+		})
+	}
+}
+
+func TestHTTP2Config(t *testing.T) {
+	expectedMaxConcurrentStreams := 42
+	expectedEncoderTableSize := 128
+	expectedDecoderTableSize := 256
+
+	// Create a listener for the server.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	// Define the server configuration.
+	configuration := &static.EntryPoint{}
+	configuration.SetDefaults()
+	configuration.HTTP2.MaxConcurrentStreams = int32(expectedMaxConcurrentStreams)
+	configuration.HTTP2.MaxEncoderHeaderTableSize = int32(expectedEncoderTableSize)
+	configuration.HTTP2.MaxDecoderHeaderTableSize = int32(expectedDecoderTableSize)
+
+	// Create the HTTP server using newHTTPServer.
+	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+	require.NoError(t, err)
+
+	// Get the underlying HTTP Server.
+	httpServer := server.Server.(*http.Server)
+
+	assert.Equal(t, expectedMaxConcurrentStreams, httpServer.HTTP2.MaxConcurrentStreams)
+	assert.Equal(t, expectedEncoderTableSize, httpServer.HTTP2.MaxEncoderHeaderTableSize)
+	assert.Equal(t, expectedDecoderTableSize, httpServer.HTTP2.MaxDecoderHeaderTableSize)
+}
+
+// TestRequestTargetForms tests the handling of the request target forms through the whole entrypoint handler chain,
+// built with the newHTTPServer func. It goes through raw TCP connections because the standard library client
+// cannot emit the malformed request targets under test.
+func TestRequestTargetForms(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	configuration := &static.EntryPoint{}
+	configuration.SetDefaults()
+
+	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+	require.NoError(t, err)
+
+	server.Switcher.UpdateHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Request-URI", r.RequestURI)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	go func() {
+		// server is expected to return an error if the listener is closed.
+		_ = server.Server.Serve(ln)
+	}()
+
+	tests := []struct {
+		desc               string
+		requestLine        string
+		expectedStatus     int
+		expectedRequestURI string
+	}{
+		{
+			desc:           "opaque target",
+			requestLine:    "GET http:admin/secret HTTP/1.1",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			desc:           "opaque target embedding an absolute URL",
+			requestLine:    "GET http:http://evil/admin/secret HTTP/1.1",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			desc:           "opaque target embedding an absolute URL with a query",
+			requestLine:    "GET http:http://evil/admin/secret?tok=1 HTTP/1.1",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			desc:           "opaque target with the https scheme",
+			requestLine:    "GET https:admin HTTP/1.1",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			desc:           "opaque target embedding a fragment",
+			requestLine:    "GET http:#frag HTTP/1.1",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			desc:               "origin-form",
+			requestLine:        "GET / HTTP/1.1",
+			expectedStatus:     http.StatusOK,
+			expectedRequestURI: "/",
+		},
+		{
+			desc:               "origin-form with a query",
+			requestLine:        "GET /a/b?q=1 HTTP/1.1",
+			expectedStatus:     http.StatusOK,
+			expectedRequestURI: "/a/b?q=1",
+		},
+		{
+			desc:               "origin-form with an encoded slash",
+			requestLine:        "GET /a%2Fb HTTP/1.1",
+			expectedStatus:     http.StatusOK,
+			expectedRequestURI: "/a%2Fb",
+		},
+		{
+			desc:               "absolute-form",
+			requestLine:        "GET http://front.example/a HTTP/1.1",
+			expectedStatus:     http.StatusOK,
+			expectedRequestURI: "/a",
+		},
+		{
+			desc:               "scheme followed by a single slash",
+			requestLine:        "GET http:/a/b HTTP/1.1",
+			expectedStatus:     http.StatusOK,
+			expectedRequestURI: "/a/b",
+		},
+		{
+			// The standard library answers the asterisk-form itself, the entrypoint handler is never reached.
+			desc:           "asterisk-form",
+			requestLine:    "OPTIONS * HTTP/1.1",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			// The authority-form is only used by CONNECT requests, which are rejected by the entrypoint handler.
+			desc:           "authority-form",
+			requestLine:    "CONNECT front.example:443 HTTP/1.1",
+			expectedStatus: http.StatusNotImplemented,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_ = conn.Close()
+			})
+
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+
+			_, err = fmt.Fprintf(conn, "%s\r\nHost: front.example\r\nConnection: close\r\n\r\n", test.requestLine)
+			require.NoError(t, err)
+
+			// The response is read with GET semantics to avoid the body framing specifics of the methods under test.
+			res, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_ = res.Body.Close()
+			})
+
+			assert.Equal(t, test.expectedStatus, res.StatusCode)
+			assert.Equal(t, test.expectedRequestURI, res.Header.Get("Request-URI"))
+		})
+	}
+}
+
+func Test_removeAliasingHeaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		headers     http.Header
+		trailers    http.Header
+		wantHeaders http.Header
+	}{
+		{
+			name:        "keeps headers without underscores",
+			headers:     http.Header{"X-Auth-User": {"foo", "bar"}},
+			wantHeaders: http.Header{"X-Auth-User": {"foo", "bar"}},
+		},
+		{
+			name:        "removes underscore variant",
+			headers:     http.Header{"X_Auth_User": {"foo"}, "X-Auth-User": {"bar"}},
+			wantHeaders: http.Header{"X-Auth-User": {"bar"}},
+		},
+		{
+			name:        "removes mixed underscore and dash variant",
+			headers:     http.Header{"X_Auth-User": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "removes non-canonical underscore variant",
+			headers:     http.Header{"x_auth_user": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "removes header named with a single underscore",
+			headers:     http.Header{"_": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "removes dot variant",
+			headers:     http.Header{"X.Auth.User": {"foo"}, "X-Auth-User": {"bar"}},
+			wantHeaders: http.Header{"X-Auth-User": {"bar"}},
+		},
+		{
+			name:        "removes every other token character variant",
+			headers:     http.Header{"X!Auth#User": {"foo"}, "X$Auth%User": {"foo"}, "X&Auth'User": {"foo"}, "X*Auth+User": {"foo"}, "X^Auth`User": {"foo"}, "X|Auth~User": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "keeps lower case dash variant",
+			headers:     http.Header{"x-auth-user": {"foo"}},
+			wantHeaders: http.Header{"x-auth-user": {"foo"}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var callCount int
+			handler := removeAliasingHeaders(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+				callCount++
+				assert.Equal(t, test.wantHeaders, req.Header)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://foo/", http.NoBody)
+			req.Header = test.headers
+			req.Trailer = test.trailers
+
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			assert.Equal(t, 1, callCount)
+		})
+	}
+}
+
+func Test_rejectAliasingHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		headers    http.Header
+		wantReject bool
+	}{
+		{
+			name:       "passes headers without underscores",
+			headers:    http.Header{"X-Auth-User": {"foo", "bar"}},
+			wantReject: false,
+		},
+		{
+			name:       "rejects underscore variant",
+			headers:    http.Header{"X_Auth_User": {"foo"}, "X-Auth-User": {"bar"}},
+			wantReject: true,
+		},
+		{
+			name:       "rejects mixed underscore and dash variant",
+			headers:    http.Header{"X_Auth-User": {"foo"}},
+			wantReject: true,
+		},
+		{
+			name:       "rejects header named with a single underscore",
+			headers:    http.Header{"_": {"foo"}},
+			wantReject: true,
+		},
+		{
+			name:       "rejects dot variant",
+			headers:    http.Header{"X.Auth.User": {"foo"}, "X-Auth-User": {"bar"}},
+			wantReject: true,
+		},
+		{
+			name:       "rejects tilde variant",
+			headers:    http.Header{"X~Auth~User": {"foo"}},
+			wantReject: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var reachedBackend bool
+			handler := rejectAliasingHeaders(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				reachedBackend = true
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://foo/", http.NoBody)
+			req.Header = test.headers
+
+			rw := httptest.NewRecorder()
+			handler.ServeHTTP(rw, req)
+
+			if test.wantReject {
+				assert.False(t, reachedBackend)
+				assert.Equal(t, http.StatusBadRequest, rw.Code)
+				return
+			}
+
+			assert.True(t, reachedBackend)
+		})
+	}
+}
+
+func Test_removeHeadersWithUnderscores(t *testing.T) {
+	tests := []struct {
+		name        string
+		headers     http.Header
+		wantHeaders http.Header
+	}{
+		{
+			name:        "keeps headers without underscores",
+			headers:     http.Header{"X-Auth-User": {"foo", "bar"}},
+			wantHeaders: http.Header{"X-Auth-User": {"foo", "bar"}},
+		},
+		{
+			name:        "removes underscore variant",
+			headers:     http.Header{"X_Auth_User": {"foo"}, "X-Auth-User": {"bar"}},
+			wantHeaders: http.Header{"X-Auth-User": {"bar"}},
+		},
+		{
+			name:        "removes mixed underscore and dash variant",
+			headers:     http.Header{"X_Auth-User": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "removes non-canonical underscore variant",
+			headers:     http.Header{"x_auth_user": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "removes header named with a single underscore",
+			headers:     http.Header{"_": {"foo"}},
+			wantHeaders: http.Header{},
+		},
+		{
+			name:        "keeps the other aliasing variants",
+			headers:     http.Header{"X.Auth.User": {"foo"}, "X!Auth!User": {"bar"}},
+			wantHeaders: http.Header{"X.Auth.User": {"foo"}, "X!Auth!User": {"bar"}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var callCount int
+			handler := removeHeadersWithUnderscores(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+				callCount++
+				assert.Equal(t, test.wantHeaders, req.Header)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://foo/", http.NoBody)
+			req.Header = test.headers
+
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			assert.Equal(t, 1, callCount)
+		})
+	}
+}
+
+func Test_rejectHeadersWithUnderscores(t *testing.T) {
+	tests := []struct {
+		name       string
+		headers    http.Header
+		wantReject bool
+	}{
+		{
+			name:       "passes headers without underscores",
+			headers:    http.Header{"X-Auth-User": {"foo", "bar"}},
+			wantReject: false,
+		},
+		{
+			name:       "rejects underscore variant",
+			headers:    http.Header{"X_Auth_User": {"foo"}, "X-Auth-User": {"bar"}},
+			wantReject: true,
+		},
+		{
+			name:       "rejects mixed underscore and dash variant",
+			headers:    http.Header{"X_Auth-User": {"foo"}},
+			wantReject: true,
+		},
+		{
+			name:       "rejects header named with a single underscore",
+			headers:    http.Header{"_": {"foo"}},
+			wantReject: true,
+		},
+		{
+			name:       "passes the other aliasing variants",
+			headers:    http.Header{"X.Auth.User": {"foo"}},
+			wantReject: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var reachedBackend bool
+			handler := rejectHeadersWithUnderscores(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				reachedBackend = true
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://foo/", http.NoBody)
+			req.Header = test.headers
+
+			rw := httptest.NewRecorder()
+			handler.ServeHTTP(rw, req)
+
+			if test.wantReject {
+				assert.False(t, reachedBackend)
+				assert.Equal(t, http.StatusBadRequest, rw.Code)
+				return
+			}
+
+			assert.True(t, reachedBackend)
+		})
+	}
+}
+
+func TestUnderscoreHeadersStrategy(t *testing.T) {
+	testCases := []struct {
+		desc                 string
+		strategy             string
+		wantStatus           int
+		wantReachedBackend   bool
+		wantUnderscoreHeader bool
+	}{
+		{
+			desc:                 "headers are kept when strategy is not set",
+			wantStatus:           http.StatusOK,
+			wantReachedBackend:   true,
+			wantUnderscoreHeader: true,
+		},
+		{
+			desc:                 "headers are kept with keep strategy",
+			strategy:             static.UnderscoreHeadersStrategyKeep,
+			wantStatus:           http.StatusOK,
+			wantReachedBackend:   true,
+			wantUnderscoreHeader: true,
+		},
+		{
+			desc:                 "underscore headers are removed with delete strategy",
+			strategy:             static.UnderscoreHeadersStrategyDelete,
+			wantStatus:           http.StatusOK,
+			wantReachedBackend:   true,
+			wantUnderscoreHeader: false,
+		},
+		{
+			desc:               "request is rejected with reject strategy",
+			strategy:           static.UnderscoreHeadersStrategyReject,
+			wantStatus:         http.StatusBadRequest,
+			wantReachedBackend: false,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			epConfig := &static.EntryPointsTransport{}
+			epConfig.SetDefaults()
+
+			entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
+				Address:          ":0",
+				Transport:        epConfig,
+				ForwardedHeaders: &static.ForwardedHeaders{},
+				HTTP2:            &static.HTTP2Config{},
+				HTTP: static.HTTPConfig{
+					UnderscoreHeadersStrategy: test.strategy,
+				},
+			}, nil, nil)
+			require.NoError(t, err)
+
+			router, err := tcprouter.NewRouter(nil)
+			require.NoError(t, err)
+
+			var reachedBackend bool
+			var gotHeaders http.Header
+			router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				reachedBackend = true
+				gotHeaders = req.Header.Clone()
+				rw.WriteHeader(http.StatusOK)
+			}))
+
+			conn, err := startEntrypoint(t, entryPoint, router)
+			require.NoError(t, err)
+
+			client := &http.Client{
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return conn, nil
+					},
+				},
+			}
+
+			req, err := http.NewRequest(http.MethodGet, "http://"+entryPoint.listener.Addr().String(), http.NoBody)
+			require.NoError(t, err)
+
+			req.Header.Set("X-Auth-User", "legit")
+			req.Header["X_Auth_User"] = []string{"spoof"}
+			req.Header["X.Auth.User"] = []string{"spoof"}
+
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+
+			assert.Equal(t, test.wantStatus, resp.StatusCode)
+			assert.Equal(t, test.wantReachedBackend, reachedBackend)
+
+			if !test.wantReachedBackend {
+				return
+			}
+
+			assert.Equal(t, []string{"legit"}, gotHeaders["X-Auth-User"])
+
+			// The deprecated option only handles the names containing an underscore character.
+			assert.Equal(t, []string{"spoof"}, gotHeaders["X.auth.user"])
+
+			if test.wantUnderscoreHeader {
+				assert.Equal(t, []string{"spoof"}, gotHeaders["X_auth_user"])
+			} else {
+				assert.NotContains(t, gotHeaders, "X_auth_user")
+			}
+		})
+	}
+}
+
+func TestHeaderNamesStrategiesWarnings(t *testing.T) {
+	testCases := []struct {
+		desc            string
+		config          static.HTTPConfig
+		wantDeprecation int
+		wantSpoofing    int
+	}{
+		{
+			desc:         "no strategy configured",
+			config:       static.HTTPConfig{},
+			wantSpoofing: 1,
+		},
+		{
+			desc:   "alias strategy explicitly set to keep",
+			config: static.HTTPConfig{AliasHeadersStrategy: static.AliasHeadersStrategyKeep},
+		},
+		{
+			desc:            "alias strategy explicitly set to keep, with the deprecated one",
+			config:          static.HTTPConfig{AliasHeadersStrategy: static.AliasHeadersStrategyKeep, UnderscoreHeadersStrategy: static.UnderscoreHeadersStrategyKeep},
+			wantDeprecation: 1,
+		},
+		{
+			desc:   "alias strategy set to delete",
+			config: static.HTTPConfig{AliasHeadersStrategy: static.AliasHeadersStrategyDelete},
+		},
+		{
+			desc:   "alias strategy set to reject",
+			config: static.HTTPConfig{AliasHeadersStrategy: static.AliasHeadersStrategyReject},
+		},
+		{
+			desc:            "deprecated strategy set to delete",
+			config:          static.HTTPConfig{UnderscoreHeadersStrategy: static.UnderscoreHeadersStrategyDelete},
+			wantDeprecation: 1,
+		},
+		{
+			desc:            "deprecated strategy explicitly set to keep",
+			config:          static.HTTPConfig{UnderscoreHeadersStrategy: static.UnderscoreHeadersStrategyKeep},
+			wantDeprecation: 1,
+			wantSpoofing:    1,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			var buf bytes.Buffer
+			ctx := zerolog.New(&buf).Level(zerolog.WarnLevel).WithContext(t.Context())
+
+			epConfig := &static.EntryPointsTransport{}
+			epConfig.SetDefaults()
+
+			_, err := NewTCPEntryPoint(ctx, "", &static.EntryPoint{
+				Address:          ":0",
+				Transport:        epConfig,
+				ForwardedHeaders: &static.ForwardedHeaders{},
+				HTTP2:            &static.HTTP2Config{},
+				HTTP:             test.config,
+			}, nil, nil)
+			require.NoError(t, err)
+
+			// The counts guard against logging the warnings once per HTTP server instead of once per entry point.
+			assert.Equal(t, test.wantDeprecation, strings.Count(buf.String(), "underscoreHeadersStrategy option is deprecated"))
+			assert.Equal(t, test.wantSpoofing, strings.Count(buf.String(), "aliasHeadersStrategy is not configured"))
+		})
+	}
+}
+
+func TestHeaderNamesStrategiesWarnings_GlobalDefault(t *testing.T) {
+	newEntryPoint := func(httpConfig static.HTTPConfig) *static.EntryPoint {
+		transport := &static.EntryPointsTransport{}
+		transport.SetDefaults()
+
+		return &static.EntryPoint{
+			Address:          ":0",
+			Transport:        transport,
+			ForwardedHeaders: &static.ForwardedHeaders{},
+			HTTP2:            &static.HTTP2Config{},
+			HTTP:             httpConfig,
+		}
+	}
+
+	build := func(t *testing.T, buf *bytes.Buffer, global string, web string) {
+		t.Helper()
+
+		ctx := zerolog.New(buf).Level(zerolog.WarnLevel).WithContext(t.Context())
+
+		cfg := &static.Configuration{
+			Providers: &static.Providers{},
+			EntryPoints: static.EntryPoints{
+				"web": newEntryPoint(static.HTTPConfig{AliasHeadersStrategy: web}),
+			},
+		}
+		if global != "" {
+			cfg.Global = &static.Global{AliasHeadersStrategy: global}
+		}
+
+		cfg.SetEffectiveConfiguration()
+		require.NoError(t, cfg.ValidateConfiguration())
+
+		_, err := NewTCPEntryPoint(ctx, "", cfg.EntryPoints["web"], nil, nil)
+		require.NoError(t, err)
+	}
+
+	t.Run("global default silences the warning like an explicit value", func(t *testing.T) {
+		var buf bytes.Buffer
+		build(t, &buf, static.AliasHeadersStrategyDelete, "")
+
+		assert.Equal(t, 0, strings.Count(buf.String(), "aliasHeadersStrategy is not configured"))
+	})
+
+	t.Run("explicit per-entry-point value wins over the global default", func(t *testing.T) {
+		var buf bytes.Buffer
+		build(t, &buf, static.AliasHeadersStrategyDelete, static.AliasHeadersStrategyKeep)
+
+		assert.Equal(t, 0, strings.Count(buf.String(), "aliasHeadersStrategy is not configured"))
+	})
+
+	t.Run("no global default keeps the warning", func(t *testing.T) {
+		var buf bytes.Buffer
+		build(t, &buf, "", "")
+
+		assert.Equal(t, 1, strings.Count(buf.String(), "aliasHeadersStrategy is not configured"))
+	})
+}
+
+func TestNewTCPEntryPoint_InvalidAliasHeadersStrategy(t *testing.T) {
+	transport := &static.EntryPointsTransport{}
+	transport.SetDefaults()
+
+	ctx := zerolog.New(io.Discard).Level(zerolog.WarnLevel).WithContext(t.Context())
+
+	_, err := NewTCPEntryPoint(ctx, "", &static.EntryPoint{
+		Address:          ":0",
+		Transport:        transport,
+		ForwardedHeaders: &static.ForwardedHeaders{},
+		HTTP2:            &static.HTTP2Config{},
+		HTTP:             static.HTTPConfig{AliasHeadersStrategy: "foobar"},
+	}, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid aliasHeadersStrategy value")
+}
+
+func Test_isAliasingHeaderName(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		name     string
+		expected bool
+	}{
+		{desc: "empty", name: "", expected: false},
+		{desc: "canonical form", name: "X-Auth-User", expected: false},
+		{desc: "lower case form", name: "x-auth-user", expected: false},
+		{desc: "single token", name: "Authorization", expected: false},
+		{desc: "digits", name: "X-Auth-User2", expected: false},
+		{desc: "underscore form", name: "X_Auth_User", expected: true},
+		{desc: "dot form", name: "X.Auth.User", expected: true},
+		{desc: "tilde form", name: "X~Auth~User", expected: true},
+		{desc: "exclamation mark form", name: "X!Auth!User", expected: true},
+		{desc: "back quote form", name: "X`Auth`User", expected: true},
+		{desc: "mixed form", name: "X-Auth_User", expected: true},
+		{desc: "single underscore", name: "_", expected: true},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, test.expected, isAliasingHeaderName(test.name))
+		})
+	}
+}
+
+// TestHTTP2RequestTLS ensures that the TLS connection state is set on the HTTP/2 requests sent over a TLS connection,
+// whatever their scheme, including CONNECT requests which have no scheme.
+func TestHTTP2RequestTLS(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	configuration := &static.EntryPoint{}
+	configuration.SetDefaults()
+
+	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
+	require.NoError(t, err)
+
+	server.Switcher.UpdateHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.TLS == nil {
+			rw.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		rw.WriteHeader(http.StatusOK)
+	}))
+
+	cert, err := generate.DefaultCertificate()
+	require.NoError(t, err)
+
+	go func() {
+		// server is expected to return an error if the listener is closed.
+		_ = server.Server.Serve(tls.NewListener(ln, &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			NextProtos:   []string{"h2"},
+		}))
+	}()
+
+	// The HTTP/2 transport allowing HTTP is used to send requests with the http scheme over a TLS connection.
+	client := &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				dialer := &tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}}}
+				return dialer.DialContext(ctx, network, addr)
+			},
+		},
+	}
+
+	testCases := []struct {
+		desc   string
+		method string
+		url    string
+	}{
+		{
+			desc:   "https scheme",
+			method: http.MethodGet,
+			url:    "https://" + ln.Addr().String(),
+		},
+		{
+			desc:   "http scheme",
+			method: http.MethodGet,
+			url:    "http://" + ln.Addr().String(),
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), test.method, test.url, http.NoBody)
+			require.NoError(t, err)
+
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+	}
+}
+
+func TestStickyBackendTransportReleasedWithClientConnection(t *testing.T) {
+	testCases := []struct {
+		desc      string
+		fastProxy bool
+		hijack    bool
+	}{
+		{
+			desc: "closed client connection",
+		},
+		{
+			desc:   "hijacked client connection",
+			hijack: true,
+		},
+		{
+			desc:      "closed client connection with FastProxy",
+			fastProxy: true,
+		},
+		{
+			desc:      "hijacked client connection with FastProxy",
+			fastProxy: true,
+			hijack:    true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			var backendConns atomic.Int32
+
+			backend := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusOK)
+			}))
+			backend.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				switch state {
+				case http.StateNew:
+					backendConns.Add(1)
+				case http.StateClosed, http.StateHijacked:
+					backendConns.Add(-1)
+				}
+			}
+			backend.Start()
+			t.Cleanup(backend.Close)
+
+			backendURL, err := url.Parse(backend.URL)
+			require.NoError(t, err)
+
+			transportManager := service.NewTransportManager(nil)
+			transportManager.Update(map[string]*dynamic.ServersTransport{"default@internal": {MaxIdleConnsPerHost: 1}})
+
+			// The proxies keep the Authorization header of the received request, so the backend connection is stuck
+			// as it would be for a real NTLM/Kerberos backend.
+			var proxy http.Handler
+			if test.fastProxy {
+				proxy, err = fast.NewProxyBuilder(transportManager, static.FastProxyConfig{}).Build("default@internal", backendURL, true, false)
+				require.NoError(t, err)
+			} else {
+				roundTripper, err := transportManager.GetRoundTripper("default@internal")
+				require.NoError(t, err)
+
+				proxy = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+					req.URL.Scheme = backendURL.Scheme
+					req.URL.Host = backendURL.Host
+					req.RequestURI = ""
+
+					resp, err := roundTripper.RoundTrip(req)
+					if err != nil {
+						rw.WriteHeader(http.StatusBadGateway)
+						return
+					}
+					_ = resp.Body.Close()
+
+					rw.WriteHeader(resp.StatusCode)
+				})
+			}
+
+			router, err := tcprouter.NewRouter(nil)
+			require.NoError(t, err)
+
+			router.SetHTTPHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				// The proxy response is recorded, so that the client connection can still be hijacked afterwards.
+				recorder := httptest.NewRecorder()
+				proxy.ServeHTTP(recorder, req)
+
+				if !test.hijack {
+					rw.WriteHeader(recorder.Code)
+					return
+				}
+
+				conn, _, err := http.NewResponseController(rw).Hijack()
+				if err != nil {
+					rw.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				defer conn.Close()
+
+				_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			}))
+
+			epConfig := &static.EntryPointsTransport{}
+			epConfig.SetDefaults()
+
+			entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
+				Address:          "127.0.0.1:0",
+				Transport:        epConfig,
+				ForwardedHeaders: &static.ForwardedHeaders{},
+				HTTP2:            &static.HTTP2Config{},
+			}, nil, nil)
+			require.NoError(t, err)
+
+			conn, err := startEntrypoint(t, entryPoint, router)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_ = conn.Close()
+				entryPoint.Shutdown(t.Context())
+			})
+
+			req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1", http.NoBody)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "NTLM TlRMTVNTUAAB")
+
+			require.NoError(t, req.Write(conn))
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			// A hijacked connection is released as soon as it is hijacked, before the response is even written.
+			if !test.hijack {
+				require.EqualValues(t, 1, backendConns.Load())
+				require.NoError(t, conn.Close())
+			}
+
+			assert.Eventually(t, func() bool { return backendConns.Load() == 0 }, 5*time.Second, 10*time.Millisecond)
+		})
 	}
 }

@@ -1,13 +1,12 @@
 package udp
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/server/service/udp"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/server/service/udp"
 )
 
 func TestRuntimeConfiguration(t *testing.T) {
@@ -46,7 +45,6 @@ func TestRuntimeConfiguration(t *testing.T) {
 				},
 				"bar": {
 					UDPRouter: &dynamic.UDPRouter{
-
 						EntryPoints: []string{"web"},
 						Service:     "foo-service",
 					},
@@ -78,7 +76,6 @@ func TestRuntimeConfiguration(t *testing.T) {
 				},
 				"bar": {
 					UDPRouter: &dynamic.UDPRouter{
-
 						EntryPoints: []string{"web"},
 						Service:     "foo-service",
 					},
@@ -108,8 +105,6 @@ func TestRuntimeConfiguration(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
-
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -122,7 +117,7 @@ func TestRuntimeConfiguration(t *testing.T) {
 			serviceManager := udp.NewManager(conf)
 			routerManager := NewManager(conf, serviceManager)
 
-			_ = routerManager.BuildHandlers(context.Background(), entryPoints)
+			_ = routerManager.BuildHandlers(t.Context(), entryPoints)
 
 			// even though conf was passed by argument to the manager builders above,
 			// it's ok to use it as the result we check, because everything worth checking

@@ -1,23 +1,20 @@
 package docker
 
 import (
-	docker "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/go-connections/nat"
+	"net/netip"
+
+	containertypes "github.com/moby/moby/api/types/container"
+	networktypes "github.com/moby/moby/api/types/network"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
 )
 
-func containerJSON(ops ...func(*docker.ContainerJSON)) docker.ContainerJSON {
-	c := &docker.ContainerJSON{
-		ContainerJSONBase: &docker.ContainerJSONBase{
-			Name:       "fake",
-			HostConfig: &container.HostConfig{},
-		},
-		Config: &container.Config{},
-		NetworkSettings: &docker.NetworkSettings{
-			NetworkSettingsBase: docker.NetworkSettingsBase{},
-		},
+func containerJSON(ops ...func(*containertypes.InspectResponse)) containertypes.InspectResponse {
+	c := &containertypes.InspectResponse{
+		Name:            "fake",
+		HostConfig:      &containertypes.HostConfig{},
+		State:           &containertypes.State{},
+		Config:          &containertypes.Config{},
+		NetworkSettings: &containertypes.NetworkSettings{},
 	}
 
 	for _, op := range ops {
@@ -27,58 +24,50 @@ func containerJSON(ops ...func(*docker.ContainerJSON)) docker.ContainerJSON {
 	return *c
 }
 
-func name(name string) func(*docker.ContainerJSON) {
-	return func(c *docker.ContainerJSON) {
-		c.ContainerJSONBase.Name = name
+func name(name string) func(*containertypes.InspectResponse) {
+	return func(c *containertypes.InspectResponse) {
+		c.Name = name
 	}
 }
 
-func networkMode(mode string) func(*docker.ContainerJSON) {
-	return func(c *docker.ContainerJSON) {
-		c.ContainerJSONBase.HostConfig.NetworkMode = container.NetworkMode(mode)
+func networkMode(mode string) func(*containertypes.InspectResponse) {
+	return func(c *containertypes.InspectResponse) {
+		c.HostConfig.NetworkMode = containertypes.NetworkMode(mode)
 	}
 }
 
-func nodeIP(ip string) func(*docker.ContainerJSON) {
-	return func(c *docker.ContainerJSON) {
-		c.ContainerJSONBase.Node = &docker.ContainerNode{
-			IPAddress: ip,
-		}
+func ports(portMap networktypes.PortMap) func(*containertypes.InspectResponse) {
+	return func(c *containertypes.InspectResponse) {
+		c.NetworkSettings.Ports = portMap
 	}
 }
 
-func labels(labels map[string]string) func(*docker.ContainerJSON) {
-	return func(c *docker.ContainerJSON) {
-		c.Config.Labels = labels
-	}
-}
-
-func ports(portMap nat.PortMap) func(*docker.ContainerJSON) {
-	return func(c *docker.ContainerJSON) {
-		c.NetworkSettings.NetworkSettingsBase.Ports = portMap
-	}
-}
-
-func withNetwork(name string, ops ...func(*network.EndpointSettings)) func(*docker.ContainerJSON) {
-	return func(c *docker.ContainerJSON) {
+func withNetwork(name string, ops ...func(*networktypes.EndpointSettings)) func(*containertypes.InspectResponse) {
+	return func(c *containertypes.InspectResponse) {
 		if c.NetworkSettings.Networks == nil {
-			c.NetworkSettings.Networks = map[string]*network.EndpointSettings{}
+			c.NetworkSettings.Networks = map[string]*networktypes.EndpointSettings{}
 		}
-		c.NetworkSettings.Networks[name] = &network.EndpointSettings{}
+		c.NetworkSettings.Networks[name] = &networktypes.EndpointSettings{}
 		for _, op := range ops {
 			op(c.NetworkSettings.Networks[name])
 		}
 	}
 }
 
-func ipv4(ip string) func(*network.EndpointSettings) {
-	return func(s *network.EndpointSettings) {
-		s.IPAddress = ip
+func ipv4(ip string) func(*networktypes.EndpointSettings) {
+	return func(s *networktypes.EndpointSettings) {
+		s.IPAddress = netip.MustParseAddr(ip).Unmap()
 	}
 }
 
-func swarmTask(id string, ops ...func(*swarm.Task)) swarm.Task {
-	task := &swarm.Task{
+func ipv6(ip string) func(*networktypes.EndpointSettings) {
+	return func(s *networktypes.EndpointSettings) {
+		s.GlobalIPv6Address = netip.MustParseAddr(ip)
+	}
+}
+
+func swarmTask(id string, ops ...func(*swarmtypes.Task)) swarmtypes.Task {
+	task := &swarmtypes.Task{
 		ID: id,
 	}
 
@@ -89,34 +78,40 @@ func swarmTask(id string, ops ...func(*swarm.Task)) swarm.Task {
 	return *task
 }
 
-func taskSlot(slot int) func(*swarm.Task) {
-	return func(task *swarm.Task) {
+func taskSlot(slot int) func(*swarmtypes.Task) {
+	return func(task *swarmtypes.Task) {
 		task.Slot = slot
 	}
 }
 
-func taskNetworkAttachment(id, name, driver string, addresses []string) func(*swarm.Task) {
-	return func(task *swarm.Task) {
-		task.NetworksAttachments = append(task.NetworksAttachments, swarm.NetworkAttachment{
-			Network: swarm.Network{
+func taskNodeID(id string) func(*swarmtypes.Task) {
+	return func(task *swarmtypes.Task) {
+		task.NodeID = id
+	}
+}
+
+func taskNetworkAttachment(id, name, driver string, addresses []string) func(*swarmtypes.Task) {
+	prefixes := make([]netip.Prefix, len(addresses))
+	for i, s := range addresses {
+		prefixes[i] = mustParseAddrOrPrefix(s)
+	}
+	return func(task *swarmtypes.Task) {
+		task.NetworksAttachments = append(task.NetworksAttachments, swarmtypes.NetworkAttachment{
+			Network: swarmtypes.Network{
 				ID: id,
-				Spec: swarm.NetworkSpec{
-					Annotations: swarm.Annotations{
-						Name: name,
-					},
-					DriverConfiguration: &swarm.Driver{
-						Name: driver,
-					},
+				Spec: swarmtypes.NetworkSpec{
+					Annotations:         swarmtypes.Annotations{Name: name},
+					DriverConfiguration: &swarmtypes.Driver{Name: driver},
 				},
 			},
-			Addresses: addresses,
+			Addresses: prefixes,
 		})
 	}
 }
 
-func taskStatus(ops ...func(*swarm.TaskStatus)) func(*swarm.Task) {
-	return func(task *swarm.Task) {
-		status := &swarm.TaskStatus{}
+func taskStatus(ops ...func(*swarmtypes.TaskStatus)) func(*swarmtypes.Task) {
+	return func(task *swarmtypes.Task) {
+		status := &swarmtypes.TaskStatus{}
 
 		for _, op := range ops {
 			op(status)
@@ -126,25 +121,25 @@ func taskStatus(ops ...func(*swarm.TaskStatus)) func(*swarm.Task) {
 	}
 }
 
-func taskState(state swarm.TaskState) func(*swarm.TaskStatus) {
-	return func(status *swarm.TaskStatus) {
+func taskState(state swarmtypes.TaskState) func(*swarmtypes.TaskStatus) {
+	return func(status *swarmtypes.TaskStatus) {
 		status.State = state
 	}
 }
 
-func taskContainerStatus(id string) func(*swarm.TaskStatus) {
-	return func(status *swarm.TaskStatus) {
-		status.ContainerStatus = &swarm.ContainerStatus{
+func taskContainerStatus(id string) func(*swarmtypes.TaskStatus) {
+	return func(status *swarmtypes.TaskStatus) {
+		status.ContainerStatus = &swarmtypes.ContainerStatus{
 			ContainerID: id,
 		}
 	}
 }
 
-func swarmService(ops ...func(*swarm.Service)) swarm.Service {
-	service := &swarm.Service{
+func swarmService(ops ...func(*swarmtypes.Service)) swarmtypes.Service {
+	service := &swarmtypes.Service{
 		ID: "serviceID",
-		Spec: swarm.ServiceSpec{
-			Annotations: swarm.Annotations{
+		Spec: swarmtypes.ServiceSpec{
+			Annotations: swarmtypes.Annotations{
 				Name: "defaultServiceName",
 			},
 		},
@@ -157,21 +152,21 @@ func swarmService(ops ...func(*swarm.Service)) swarm.Service {
 	return *service
 }
 
-func serviceName(name string) func(service *swarm.Service) {
-	return func(service *swarm.Service) {
+func serviceName(name string) func(service *swarmtypes.Service) {
+	return func(service *swarmtypes.Service) {
 		service.Spec.Annotations.Name = name
 	}
 }
 
-func serviceLabels(labels map[string]string) func(service *swarm.Service) {
-	return func(service *swarm.Service) {
+func serviceLabels(labels map[string]string) func(service *swarmtypes.Service) {
+	return func(service *swarmtypes.Service) {
 		service.Spec.Annotations.Labels = labels
 	}
 }
 
-func withEndpoint(ops ...func(*swarm.Endpoint)) func(*swarm.Service) {
-	return func(service *swarm.Service) {
-		endpoint := &swarm.Endpoint{}
+func withEndpoint(ops ...func(*swarmtypes.Endpoint)) func(*swarmtypes.Service) {
+	return func(service *swarmtypes.Service) {
+		endpoint := &swarmtypes.Endpoint{}
 
 		for _, op := range ops {
 			op(endpoint)
@@ -181,21 +176,21 @@ func withEndpoint(ops ...func(*swarm.Endpoint)) func(*swarm.Service) {
 	}
 }
 
-func virtualIP(networkID, addr string) func(*swarm.Endpoint) {
-	return func(endpoint *swarm.Endpoint) {
+func virtualIP(networkID, addr string) func(*swarmtypes.Endpoint) {
+	return func(endpoint *swarmtypes.Endpoint) {
 		if endpoint.VirtualIPs == nil {
-			endpoint.VirtualIPs = []swarm.EndpointVirtualIP{}
+			endpoint.VirtualIPs = []swarmtypes.EndpointVirtualIP{}
 		}
-		endpoint.VirtualIPs = append(endpoint.VirtualIPs, swarm.EndpointVirtualIP{
+		endpoint.VirtualIPs = append(endpoint.VirtualIPs, swarmtypes.EndpointVirtualIP{
 			NetworkID: networkID,
-			Addr:      addr,
+			Addr:      mustParseAddrOrPrefix(addr),
 		})
 	}
 }
 
-func withEndpointSpec(ops ...func(*swarm.EndpointSpec)) func(*swarm.Service) {
-	return func(service *swarm.Service) {
-		endpointSpec := &swarm.EndpointSpec{}
+func withEndpointSpec(ops ...func(*swarmtypes.EndpointSpec)) func(*swarmtypes.Service) {
+	return func(service *swarmtypes.Service) {
+		endpointSpec := &swarmtypes.EndpointSpec{}
 
 		for _, op := range ops {
 			op(endpointSpec)
@@ -205,10 +200,28 @@ func withEndpointSpec(ops ...func(*swarm.EndpointSpec)) func(*swarm.Service) {
 	}
 }
 
-func modeDNSSR(spec *swarm.EndpointSpec) {
-	spec.Mode = swarm.ResolutionModeDNSRR
+func modeDNSRR(spec *swarmtypes.EndpointSpec) {
+	spec.Mode = swarmtypes.ResolutionModeDNSRR
 }
 
-func modeVIP(spec *swarm.EndpointSpec) {
-	spec.Mode = swarm.ResolutionModeVIP
+func modeVIP(spec *swarmtypes.EndpointSpec) {
+	spec.Mode = swarmtypes.ResolutionModeVIP
+}
+
+// mustParseAddrOrPrefix parses addrOrPrefix into a [netip.Prefix].
+//
+// We should expect only IP-addresses, but for backwards-compatibility,
+// the Addresses field on [swarmtypes.NetworkAttachment] accepts a prefix.
+func mustParseAddrOrPrefix(addrOrPrefix string) netip.Prefix {
+	if addrOrPrefix == "" {
+		return netip.Prefix{}
+	}
+	if p, err := netip.ParsePrefix(addrOrPrefix); err == nil {
+		return p
+	}
+	a := netip.MustParseAddr(addrOrPrefix)
+	if a.Is4() {
+		return netip.PrefixFrom(a, 32)
+	}
+	return netip.PrefixFrom(a, 128)
 }

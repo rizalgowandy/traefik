@@ -1,22 +1,24 @@
 package docker
 
 import (
-	"context"
+	"net/netip"
 	"strconv"
 	"testing"
+	"time"
 
-	docker "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/go-connections/nat"
+	containertypes "github.com/moby/moby/api/types/container"
+	networktypes "github.com/moby/moby/api/types/network"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+	ptypes "github.com/traefik/paerser/types"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/provider"
+	"github.com/traefik/traefik/v3/pkg/tls"
+	"github.com/traefik/traefik/v3/pkg/types"
 )
 
-func Int(v int) *int    { return &v }
-func Bool(v bool) *bool { return &v }
-
-func TestDefaultRule(t *testing.T) {
+func TestDynConfBuilder_DefaultRule(t *testing.T) {
 	testCases := []struct {
 		desc        string
 		containers  []dockerData
@@ -31,8 +33,8 @@ func TestDefaultRule(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -46,9 +48,10 @@ func TestDefaultRule(t *testing.T) {
 			defaultRule: "Host(`foo.bar`)",
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -57,24 +60,32 @@ func TestDefaultRule(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`foo.bar`)",
+							Service:     "Test",
+							Rule:        "Host(`foo.bar`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -86,8 +97,8 @@ func TestDefaultRule(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -101,9 +112,10 @@ func TestDefaultRule(t *testing.T) {
 			defaultRule: "Host(`{{ .Name }}.foo.bar`)",
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -112,24 +124,32 @@ func TestDefaultRule(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.foo.bar`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.foo.bar`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -143,8 +163,8 @@ func TestDefaultRule(t *testing.T) {
 						"traefik.domain": "foo.bar",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -158,9 +178,10 @@ func TestDefaultRule(t *testing.T) {
 			defaultRule: `Host("{{ .Name }}.{{ index .Labels "traefik.domain" }}")`,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -169,24 +190,32 @@ func TestDefaultRule(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    `Host("Test.foo.bar")`,
+							Service:     "Test",
+							Rule:        `Host("Test.foo.bar")`,
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -198,8 +227,8 @@ func TestDefaultRule(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -213,9 +242,10 @@ func TestDefaultRule(t *testing.T) {
 			defaultRule: `Host("{{ .Toto }}")`,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -227,16 +257,23 @@ func TestDefaultRule(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -248,8 +285,8 @@ func TestDefaultRule(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -263,9 +300,10 @@ func TestDefaultRule(t *testing.T) {
 			defaultRule: ``,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -277,16 +315,23 @@ func TestDefaultRule(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -298,8 +343,8 @@ func TestDefaultRule(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -313,9 +358,10 @@ func TestDefaultRule(t *testing.T) {
 			defaultRule: DefaultTemplateRule,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -324,31 +370,38 @@ func TestDefaultRule(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test`)",
+							Service:     "Test",
+							Rule:        "Host(`Test`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -356,30 +409,31 @@ func TestDefaultRule(t *testing.T) {
 				ExposedByDefault: true,
 				DefaultRule:      test.defaultRule,
 			}
+			require.NoError(t, p.Init())
 
-			err := p.Init()
-			require.NoError(t, err)
+			builder := NewDynConfBuilder(p.Shared, nil, false)
 
-			for i := 0; i < len(test.containers); i++ {
+			for i := range len(test.containers) {
 				var err error
-				test.containers[i].ExtraConf, err = p.getConfiguration(test.containers[i])
+				test.containers[i].ExtraConf, err = builder.extractLabels(test.containers[i])
 				require.NoError(t, err)
 			}
 
-			configuration := p.buildConfiguration(context.Background(), test.containers)
+			configuration := builder.build(t.Context(), test.containers)
 
 			assert.Equal(t, test.expected, configuration)
 		})
 	}
 }
 
-func Test_buildConfiguration(t *testing.T) {
+func TestDynConfBuilder_build(t *testing.T) {
 	testCases := []struct {
-		desc          string
-		containers    []dockerData
-		useBindPortIP bool
-		constraints   string
-		expected      *dynamic.Configuration
+		desc               string
+		containers         []dockerData
+		useBindPortIP      bool
+		constraints        string
+		expected           *dynamic.Configuration
+		allowEmptyServices bool
 	}{
 		{
 			desc: "invalid HTTP service definition",
@@ -391,8 +445,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.test": "",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -405,9 +459,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -418,6 +473,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -431,8 +489,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.tcp.services.test": "",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -445,9 +503,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -458,6 +517,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -471,8 +533,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.udp.services.test": "",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/udp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/udp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -485,9 +547,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -499,6 +562,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
 				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
 			},
 		},
 		{
@@ -509,8 +575,8 @@ func Test_buildConfiguration(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -523,9 +589,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -534,24 +601,32 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -563,8 +638,8 @@ func Test_buildConfiguration(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -579,8 +654,8 @@ func Test_buildConfiguration(t *testing.T) {
 					Name:        "Test2",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -593,9 +668,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -604,38 +680,51 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 						"Test2": {
-							Service: "Test2",
-							Rule:    "Host(`Test2.traefik.wtf`)",
+							Service:     "Test2",
+							Rule:        "Host(`Test2.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 						"Test2": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -648,8 +737,8 @@ func Test_buildConfiguration(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -665,8 +754,8 @@ func Test_buildConfiguration(t *testing.T) {
 					Name:        "Test",
 					Labels:      map[string]string{},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -679,9 +768,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -690,14 +780,16 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -706,11 +798,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -724,8 +822,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -738,9 +836,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -749,24 +848,32 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Service1",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -782,8 +889,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.service":                       "Service1",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -796,9 +903,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -815,16 +923,23 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -838,8 +953,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -852,9 +967,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -865,12 +981,16 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
@@ -881,6 +1001,9 @@ func Test_buildConfiguration(t *testing.T) {
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -895,8 +1018,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -909,9 +1032,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -928,16 +1052,23 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -953,8 +1084,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service2.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -967,9 +1098,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -981,26 +1113,37 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 						"Service2": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1015,8 +1158,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.service": "Service1",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1029,9 +1172,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1048,16 +1192,23 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1072,8 +1223,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1091,8 +1242,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "false",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1105,9 +1256,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1116,13 +1268,17 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Service1",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1137,8 +1293,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "false",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1156,8 +1312,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1175,8 +1331,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1189,9 +1345,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1200,13 +1357,17 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Service1",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1221,8 +1382,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1240,8 +1401,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1254,9 +1415,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1265,14 +1427,16 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Service1",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1281,11 +1445,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1299,8 +1469,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1313,9 +1483,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1324,19 +1495,24 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
@@ -1348,6 +1524,9 @@ func Test_buildConfiguration(t *testing.T) {
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1362,8 +1541,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1381,8 +1560,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1395,9 +1574,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1406,8 +1586,9 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{
@@ -1420,6 +1601,7 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1428,11 +1610,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1447,8 +1635,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1466,8 +1654,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "41",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1480,9 +1668,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1491,14 +1680,16 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1507,11 +1698,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1526,8 +1723,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1545,8 +1742,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "41",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1564,8 +1761,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "40",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1578,9 +1775,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1589,14 +1787,16 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1608,11 +1808,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.3:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1627,8 +1833,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1646,8 +1852,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`bar.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1660,9 +1866,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1674,6 +1881,7 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1682,11 +1890,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1701,8 +1915,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1720,8 +1934,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`bar.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1739,8 +1953,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foobar.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1753,9 +1967,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1767,6 +1982,7 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1778,11 +1994,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.3:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1797,8 +2019,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1816,8 +2038,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1830,9 +2052,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1849,6 +2072,7 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -1857,11 +2081,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1875,8 +2105,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1893,8 +2123,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Router1.rule": "Host(`foo.com`)",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1907,9 +2137,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1921,26 +2152,37 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 						"Test2": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -1954,8 +2196,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.wrong.label": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -1968,9 +2210,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -1979,24 +2222,32 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2011,8 +2262,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.LoadBalancer.server.port":   "8080",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2025,9 +2276,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2036,24 +2288,32 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Service1",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "h2c://127.0.0.1:8080",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2068,8 +2328,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service2.LoadBalancer.server.port": "8080",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2082,9 +2342,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2096,38 +2357,53 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 						"Service2": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:8080",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
 				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
 			},
 		},
 		{
-			desc: "one container without port",
+			desc: "one container with label url",
 			containers: []dockerData{
 				{
 					ServiceName: "Test",
 					Name:        "Test",
-					Labels:      map[string]string{},
+					Labels: map[string]string{
+						"traefik.http.services.Service1.LoadBalancer.server.url": "http://1.2.3.4:5678",
+					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("4567/tcp"): []networktypes.PortBinding{},
+						},
 						Networks: map[string]*networkData{
 							"bridge": {
 								Name: "bridge",
@@ -2139,9 +2415,143 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Service1": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
+								Servers: []dynamic.Server{
+									{
+										URL: "http://1.2.3.4:5678",
+									},
+								},
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one container with label url and preserve path",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Labels: map[string]string{
+						"traefik.http.services.Service1.LoadBalancer.server.url":          "http://1.2.3.4:5678",
+						"traefik.http.services.Service1.LoadBalancer.server.preservepath": "true",
+					},
+					NetworkSettings: networkSettings{
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("4567/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Service1": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
+								Servers: []dynamic.Server{
+									{
+										URL:          "http://1.2.3.4:5678",
+										PreservePath: true,
+									},
+								},
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one container with label url and port",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Labels: map[string]string{
+						"traefik.http.services.Service1.LoadBalancer.server.url":  "http://1.2.3.4:5678",
+						"traefik.http.services.Service1.LoadBalancer.server.port": "1234",
+					},
+					NetworkSettings: networkSettings{
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("4567/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2152,6 +2562,94 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one container with label url and scheme",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Labels: map[string]string{
+						"traefik.http.services.Service1.LoadBalancer.server.url":    "http://1.2.3.4:5678",
+						"traefik.http.services.Service1.LoadBalancer.server.scheme": "https",
+					},
+					NetworkSettings: networkSettings{
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("4567/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one container without port",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Labels:      map[string]string{},
+					NetworkSettings: networkSettings{
+						Ports: networktypes.PortMap{},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2165,7 +2663,7 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.middlewares.Middleware1.inflightreq.amount": "42",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{},
+						Ports: networktypes.PortMap{},
 						Networks: map[string]*networkData{
 							"bridge": {
 								Name: "bridge",
@@ -2177,9 +2675,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2190,6 +2689,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2203,8 +2705,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.enable": "false",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2217,9 +2719,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2230,35 +2733,27 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
 		{
-			desc: "one container not healthy",
+			desc: "one unhealthy HTTP container",
 			containers: []dockerData{
 				{
 					ServiceName: "Test",
 					Name:        "Test",
-					Labels:      map[string]string{},
-					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
-						},
-						Networks: map[string]*networkData{
-							"bridge": {
-								Name: "bridge",
-								Addr: "127.0.0.1",
-							},
-						},
-					},
-					Health: "not_healthy",
+					Health:      containertypes.Unhealthy,
 				},
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2269,6 +2764,212 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc:               "one unhealthy HTTP container with allowEmptyServices",
+			allowEmptyServices: true,
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Health:      containertypes.Unhealthy,
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Test": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy:       dynamic.BalancerStrategyWRR,
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one unhealthy TCP container",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Health:      containertypes.Unhealthy,
+					Labels: map[string]string{
+						"traefik.tcp.routers.foo.rule": "HostSNI(`foo.bar`)",
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc:               "one unhealthy TCP container with allowEmptyServices",
+			allowEmptyServices: true,
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Health:      containertypes.Unhealthy,
+					Labels: map[string]string{
+						"traefik.tcp.routers.foo.rule": "HostSNI(`foo.bar`)",
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers: map[string]*dynamic.TCPRouter{
+						"foo": {
+							Service: "Test",
+							Rule:    "HostSNI(`foo.bar`)",
+						},
+					},
+					Middlewares: map[string]*dynamic.TCPMiddleware{},
+					Services: map[string]*dynamic.TCPService{
+						"Test": {
+							LoadBalancer: &dynamic.TCPServersLoadBalancer{},
+						},
+					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one unhealthy UDP container",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Health:      containertypes.Unhealthy,
+					Labels: map[string]string{
+						"traefik.udp.routers.foo": "true",
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc:               "one unhealthy UDP container with allowEmptyServices",
+			allowEmptyServices: true,
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Labels: map[string]string{
+						"traefik.udp.routers.foo": "true",
+					},
+					Health: containertypes.Unhealthy,
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers: map[string]*dynamic.UDPRouter{
+						"foo": {
+							Service: "Test",
+						},
+					},
+					Services: map[string]*dynamic.UDPService{
+						"Test": {
+							LoadBalancer: &dynamic.UDPServersLoadBalancer{},
+						},
+					},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2282,8 +2983,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.tags": "foo",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2297,9 +2998,10 @@ func Test_buildConfiguration(t *testing.T) {
 			constraints: `Label("traefik.tags", "bar")`,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2310,6 +3012,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2323,8 +3028,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.tags": "foo",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2338,9 +3043,10 @@ func Test_buildConfiguration(t *testing.T) {
 			constraints: `Label("traefik.tags", "foo")`,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2349,24 +3055,32 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2381,8 +3095,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.routers.Test.middlewares":                "Middleware1",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2395,9 +3109,10 @@ func Test_buildConfiguration(t *testing.T) {
 			},
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2409,6 +3124,7 @@ func Test_buildConfiguration(t *testing.T) {
 							Service:     "Test",
 							Rule:        "Host(`Test.traefik.wtf`)",
 							Middlewares: []string{"Middleware1"},
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{
@@ -2424,16 +3140,23 @@ func Test_buildConfiguration(t *testing.T) {
 					Services: map[string]*dynamic.Service{
 						"Test": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2445,12 +3168,12 @@ func Test_buildConfiguration(t *testing.T) {
 					Name:        "Test",
 					Labels: map[string]string{
 						"traefik.tcp.routers.Test.rule":                               "HostSNI(`foo.bar`)",
-						"traefik.tcp.middlewares.Middleware1.ipwhitelist.sourcerange": "foobar, fiibar",
+						"traefik.tcp.middlewares.Middleware1.ipallowlist.sourcerange": "foobar, fiibar",
 						"traefik.tcp.routers.Test.middlewares":                        "Middleware1",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2472,7 +3195,7 @@ func Test_buildConfiguration(t *testing.T) {
 					},
 					Middlewares: map[string]*dynamic.TCPMiddleware{
 						"Middleware1": {
-							IPWhiteList: &dynamic.TCPIPWhiteList{
+							IPAllowList: &dynamic.TCPIPAllowList{
 								SourceRange: []string{"foobar", "fiibar"},
 							},
 						},
@@ -2485,10 +3208,10 @@ func Test_buildConfiguration(t *testing.T) {
 										Address: "127.0.0.1:80",
 									},
 								},
-								TerminationDelay: Int(100),
 							},
 						},
 					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2499,6 +3222,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2513,8 +3239,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.tcp.routers.foo.tls":  "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2543,10 +3269,10 @@ func Test_buildConfiguration(t *testing.T) {
 										Address: "127.0.0.1:80",
 									},
 								},
-								TerminationDelay: Int(100),
 							},
 						},
 					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2557,6 +3283,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2570,8 +3299,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.udp.routers.foo.entrypoints": "mydns",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2603,15 +3332,19 @@ func Test_buildConfiguration(t *testing.T) {
 					},
 				},
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers:           map[string]*dynamic.Router{},
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2625,8 +3358,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.tcp.routers.foo.tls": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2649,10 +3382,10 @@ func Test_buildConfiguration(t *testing.T) {
 										Address: "127.0.0.1:80",
 									},
 								},
-								TerminationDelay: Int(100),
 							},
 						},
 					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2663,6 +3396,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2678,8 +3414,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.tcp.services.foo.loadbalancer.server.port": "8080",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2710,10 +3446,10 @@ func Test_buildConfiguration(t *testing.T) {
 										Address: "127.0.0.1:8080",
 									},
 								},
-								TerminationDelay: Int(100),
 							},
 						},
 					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2724,6 +3460,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2738,8 +3477,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.udp.services.foo.loadbalancer.server.port": "8080",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2771,15 +3510,19 @@ func Test_buildConfiguration(t *testing.T) {
 					},
 				},
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers:           map[string]*dynamic.Router{},
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2795,8 +3538,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2816,8 +3559,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Service1.loadbalancer.passhostheader": "true",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2852,21 +3595,24 @@ func Test_buildConfiguration(t *testing.T) {
 					},
 				},
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Service1",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Service1",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
 					Services: map[string]*dynamic.Service{
 						"Service1": {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
 								Servers: []dynamic.Server{
 									{
 										URL: "http://127.0.0.1:80",
@@ -2875,11 +3621,17 @@ func Test_buildConfiguration(t *testing.T) {
 										URL: "http://127.0.0.2:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2893,8 +3645,8 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.udp.services.foo.loadbalancer.server.port": "8080",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2921,9 +3673,10 @@ func Test_buildConfiguration(t *testing.T) {
 					},
 				},
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers:           map[string]*dynamic.Router{},
@@ -2931,21 +3684,24 @@ func Test_buildConfiguration(t *testing.T) {
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
 				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
 			},
 		},
 		{
+			// TODO: replace or delete?
 			desc: "tcp with label for tcp service, with termination delay",
 			containers: []dockerData{
 				{
 					ServiceName: "Test",
 					Name:        "Test",
 					Labels: map[string]string{
-						"traefik.tcp.services.foo.loadbalancer.server.port":      "8080",
-						"traefik.tcp.services.foo.loadbalancer.terminationdelay": "200",
+						"traefik.tcp.services.foo.loadbalancer.server.port": "8080",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("80/tcp"): []nat.PortBinding{},
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
 						},
 						Networks: map[string]*networkData{
 							"bridge": {
@@ -2968,10 +3724,10 @@ func Test_buildConfiguration(t *testing.T) {
 										Address: "127.0.0.1:8080",
 									},
 								},
-								TerminationDelay: Int(200),
 							},
 						},
 					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -2982,6 +3738,9 @@ func Test_buildConfiguration(t *testing.T) {
 					Middlewares:       map[string]*dynamic.Middleware{},
 					Services:          map[string]*dynamic.Service{},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
@@ -2995,13 +3754,13 @@ func Test_buildConfiguration(t *testing.T) {
 						"traefik.http.services.Test.loadbalancer.server.port": "80",
 					},
 					NetworkSettings: networkSettings{
-						Ports: nat.PortMap{
-							nat.Port("79/tcp"): []nat.PortBinding{{
-								HostIP:   "192.168.0.1",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("79/tcp"): []networktypes.PortBinding{{
+								HostIP:   netip.MustParseAddr("192.168.0.1"),
 								HostPort: "8080",
 							}},
-							nat.Port("80/tcp"): []nat.PortBinding{{
-								HostIP:   "192.168.0.1",
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{{
+								HostIP:   netip.MustParseAddr("192.168.0.1"),
 								HostPort: "8081",
 							}},
 						},
@@ -3017,9 +3776,10 @@ func Test_buildConfiguration(t *testing.T) {
 			useBindPortIP: true,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
-					Routers:     map[string]*dynamic.TCPRouter{},
-					Middlewares: map[string]*dynamic.TCPMiddleware{},
-					Services:    map[string]*dynamic.TCPService{},
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				UDP: &dynamic.UDPConfiguration{
 					Routers:  map[string]*dynamic.UDPRouter{},
@@ -3028,8 +3788,311 @@ func Test_buildConfiguration(t *testing.T) {
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: map[string]*dynamic.Router{
 						"Test": {
-							Service: "Test",
-							Rule:    "Host(`Test.traefik.wtf`)",
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Test": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
+								Servers: []dynamic.Server{
+									{
+										URL: "http://192.168.0.1:8081",
+									},
+								},
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "one container with default generated certificate labels",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Labels: map[string]string{
+						"traefik.tls.stores.default.defaultgeneratedcert.resolver":    "foobar",
+						"traefik.tls.stores.default.defaultgeneratedcert.domain.main": "foobar",
+						"traefik.tls.stores.default.defaultgeneratedcert.domain.sans": "foobar, fiibar",
+					},
+					NetworkSettings: networkSettings{
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("79/tcp"): []networktypes.PortBinding{{
+								HostIP:   netip.MustParseAddr("192.168.0.1"),
+								HostPort: "8080",
+							}},
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{{
+								HostIP:   netip.MustParseAddr("192.168.0.1"),
+								HostPort: "8081",
+							}},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Test",
+							Rule:        "Host(`Test.traefik.wtf`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Test": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								Strategy: dynamic.BalancerStrategyWRR,
+								Servers: []dynamic.Server{
+									{
+										URL: "http://127.0.0.1:79",
+									},
+								},
+								PassHostHeader: new(true),
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{
+						"default": {
+							DefaultGeneratedCert: &tls.GeneratedCert{
+								Resolver: "foobar",
+								Domain: &types.Domain{
+									Main: "foobar",
+									SANs: []string{"foobar", "fiibar"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			p := Provider{
+				AllowEmptyServices: test.allowEmptyServices,
+				ExposedByDefault:   true,
+				UseBindPortIP:      test.useBindPortIP,
+				DefaultRule:        "Host(`{{ normalize .Name }}.traefik.wtf`)",
+				Constraints:        test.constraints,
+			}
+
+			require.NoError(t, p.Init())
+
+			builder := NewDynConfBuilder(p.Shared, nil, false)
+
+			for i := range len(test.containers) {
+				var err error
+				test.containers[i].ExtraConf, err = builder.extractLabels(test.containers[i])
+				require.NoError(t, err)
+			}
+
+			configuration := builder.build(t.Context(), test.containers)
+
+			assert.Equal(t, test.expected, configuration)
+		})
+	}
+}
+
+func TestDynConfBuilder_build_allowNonRunning(t *testing.T) {
+	testCases := []struct {
+		desc       string
+		containers []dockerData
+		expected   *dynamic.Configuration
+	}{
+		{
+			desc: "exited container with allowNonRunning=true should create router and service without servers",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "exited",
+					Health:      "",
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: true,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Test",
+							Rule:        "Host(`Test`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Test": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								PassHostHeader: new(true),
+								Strategy:       "wrr",
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "exited container with allowNonRunning=false should not create anything",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "exited",
+					Health:      "",
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: false,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "running container with allowNonRunning=true should work normally with servers",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "running",
+					Health:      "",
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: true,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Test",
+							Rule:        "Host(`Test`)",
+							DefaultRule: true,
 						},
 					},
 					Middlewares: map[string]*dynamic.Middleware{},
@@ -3038,49 +4101,296 @@ func Test_buildConfiguration(t *testing.T) {
 							LoadBalancer: &dynamic.ServersLoadBalancer{
 								Servers: []dynamic.Server{
 									{
-										URL: "http://192.168.0.1:8081",
+										URL: "http://127.0.0.1:80",
 									},
 								},
-								PassHostHeader: Bool(true),
+								PassHostHeader: new(true),
+								Strategy:       "wrr",
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
 							},
 						},
 					},
 					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "created container with allowNonRunning=true should create router and service without servers)",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "created",
+					Health:      "",
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: true,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Test",
+							Rule:        "Host(`Test`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Test": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								PassHostHeader: new(true),
+								Strategy:       "wrr",
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "dead container with allowNonRunning=true should create router and service without servers)",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "dead",
+					Health:      "",
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: true,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers: map[string]*dynamic.Router{
+						"Test": {
+							Service:     "Test",
+							Rule:        "Host(`Test`)",
+							DefaultRule: true,
+						},
+					},
+					Middlewares: map[string]*dynamic.Middleware{},
+					Services: map[string]*dynamic.Service{
+						"Test": {
+							LoadBalancer: &dynamic.ServersLoadBalancer{
+								PassHostHeader: new(true),
+								Strategy:       "wrr",
+								ResponseForwarding: &dynamic.ResponseForwarding{
+									FlushInterval: ptypes.Duration(100 * time.Millisecond),
+								},
+							},
+						},
+					},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "exited container with TCP configuration and allowNonRunning=true should create TCP service without servers",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "exited",
+					Health:      "",
+					Labels: map[string]string{
+						"traefik.tcp.routers.Test.rule": "HostSNI(`test.localhost`)",
+					},
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: true,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers: map[string]*dynamic.TCPRouter{
+						"Test": {
+							Service: "Test",
+							Rule:    "HostSNI(`test.localhost`)",
+						},
+					},
+					Middlewares: map[string]*dynamic.TCPMiddleware{},
+					Services: map[string]*dynamic.TCPService{
+						"Test": {
+							LoadBalancer: &dynamic.TCPServersLoadBalancer{},
+						},
+					},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers:  map[string]*dynamic.UDPRouter{},
+					Services: map[string]*dynamic.UDPService{},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
+				},
+			},
+		},
+		{
+			desc: "exited container with UDP configuration and allowNonRunning=true should create UDP service without servers",
+			containers: []dockerData{
+				{
+					ServiceName: "Test",
+					Name:        "Test",
+					Status:      "exited",
+					Health:      "",
+					Labels: map[string]string{
+						"traefik.udp.routers.Test.entrypoints": "udp",
+					},
+					ExtraConf: configuration{
+						Enable:          true,
+						AllowNonRunning: true,
+					},
+					NetworkSettings: networkSettings{
+						NetworkMode: "bridge",
+						Ports: networktypes.PortMap{
+							networktypes.MustParsePort("80/udp"): []networktypes.PortBinding{},
+						},
+						Networks: map[string]*networkData{
+							"bridge": {
+								Name: "bridge",
+								Addr: "127.0.0.1",
+							},
+						},
+					},
+				},
+			},
+			expected: &dynamic.Configuration{
+				TCP: &dynamic.TCPConfiguration{
+					Routers:           map[string]*dynamic.TCPRouter{},
+					Middlewares:       map[string]*dynamic.TCPMiddleware{},
+					Services:          map[string]*dynamic.TCPService{},
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
+				},
+				UDP: &dynamic.UDPConfiguration{
+					Routers: map[string]*dynamic.UDPRouter{
+						"Test": {
+							Service:     "Test",
+							EntryPoints: []string{"udp"},
+						},
+					},
+					Services: map[string]*dynamic.UDPService{
+						"Test": {
+							LoadBalancer: &dynamic.UDPServersLoadBalancer{},
+						},
+					},
+				},
+				HTTP: &dynamic.HTTPConfiguration{
+					Routers:           map[string]*dynamic.Router{},
+					Middlewares:       map[string]*dynamic.Middleware{},
+					Services:          map[string]*dynamic.Service{},
+					ServersTransports: map[string]*dynamic.ServersTransport{},
+				},
+				TLS: &dynamic.TLSConfiguration{
+					Stores: map[string]tls.Store{},
 				},
 			},
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
-
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			p := Provider{
-				ExposedByDefault: true,
-				DefaultRule:      "Host(`{{ normalize .Name }}.traefik.wtf`)",
-				UseBindPortIP:    test.useBindPortIP,
-			}
-			p.Constraints = test.constraints
-
-			err := p.Init()
+			defaultRuleTpl, err := provider.MakeDefaultRuleTemplate(DefaultTemplateRule, nil)
 			require.NoError(t, err)
 
-			for i := 0; i < len(test.containers); i++ {
-				var err error
-				test.containers[i].ExtraConf, err = p.getConfiguration(test.containers[i])
-				require.NoError(t, err)
+			p := Shared{
+				ExposedByDefault: true,
+				DefaultRule:      DefaultTemplateRule,
+				defaultRuleTpl:   defaultRuleTpl,
 			}
 
-			configuration := p.buildConfiguration(context.Background(), test.containers)
+			builder := NewDynConfBuilder(p, nil, false)
+			configuration := builder.build(t.Context(), test.containers)
 
 			assert.Equal(t, test.expected, configuration)
 		})
 	}
 }
 
-func TestDockerGetIPPort(t *testing.T) {
+func TestDynConfBuilder_getIPPort_docker(t *testing.T) {
 	type expected struct {
 		ip    string
 		port  string
@@ -3089,15 +4399,15 @@ func TestDockerGetIPPort(t *testing.T) {
 
 	testCases := []struct {
 		desc       string
-		container  docker.ContainerJSON
+		container  containertypes.InspectResponse
 		serverPort string
 		expected   expected
 	}{
 		{
 			desc: "label traefik.port not set, no binding, falling back on the container's IP/Port",
 			container: containerJSON(
-				ports(nat.PortMap{
-					"8080/tcp": {},
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("8080/tcp"): {},
 				}),
 				withNetwork("testnet", ipv4("10.11.12.13"))),
 			expected: expected{
@@ -3109,8 +4419,8 @@ func TestDockerGetIPPort(t *testing.T) {
 			desc: "label traefik.port not set, single binding with port only, falling back on the container's IP/Port",
 			container: containerJSON(
 				withNetwork("testnet", ipv4("10.11.12.13")),
-				ports(nat.PortMap{
-					"80/tcp": []nat.PortBinding{
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{
 						{
 							HostPort: "8082",
 						},
@@ -3125,10 +4435,10 @@ func TestDockerGetIPPort(t *testing.T) {
 		{
 			desc: "label traefik.port not set, binding with ip:port should create a route to the bound ip:port",
 			container: containerJSON(
-				ports(nat.PortMap{
-					"80/tcp": []nat.PortBinding{
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "1.2.3.4",
+							HostIP:   netip.MustParseAddr("1.2.3.4"),
 							HostPort: "8081",
 						},
 					},
@@ -3151,10 +4461,10 @@ func TestDockerGetIPPort(t *testing.T) {
 		{
 			desc: "label traefik.port set, single binding with ip:port for the label, creates the route",
 			container: containerJSON(
-				ports(nat.PortMap{
-					"443/tcp": []nat.PortBinding{
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("443/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "5.6.7.8",
+							HostIP:   netip.MustParseAddr("5.6.7.8"),
 							HostPort: "8082",
 						},
 					},
@@ -3169,10 +4479,10 @@ func TestDockerGetIPPort(t *testing.T) {
 		{
 			desc: "label traefik.port set, no binding on the corresponding port, falling back on the container's IP/label.port",
 			container: containerJSON(
-				ports(nat.PortMap{
-					"443/tcp": []nat.PortBinding{
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("443/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "5.6.7.8",
+							HostIP:   netip.MustParseAddr("5.6.7.8"),
 							HostPort: "8082",
 						},
 					},
@@ -3187,16 +4497,16 @@ func TestDockerGetIPPort(t *testing.T) {
 		{
 			desc: "label traefik.port set, multiple bindings on different ports, uses the label to select the correct (first) binding",
 			container: containerJSON(
-				ports(nat.PortMap{
-					"80/tcp": []nat.PortBinding{
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "1.2.3.4",
+							HostIP:   netip.MustParseAddr("1.2.3.4"),
 							HostPort: "8081",
 						},
 					},
-					"443/tcp": []nat.PortBinding{
+					networktypes.MustParsePort("443/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "5.6.7.8",
+							HostIP:   netip.MustParseAddr("5.6.7.8"),
 							HostPort: "8082",
 						},
 					},
@@ -3211,16 +4521,16 @@ func TestDockerGetIPPort(t *testing.T) {
 		{
 			desc: "label traefik.port set, multiple bindings on different ports, uses the label to select the correct (second) binding",
 			container: containerJSON(
-				ports(nat.PortMap{
-					"80/tcp": []nat.PortBinding{
+				ports(networktypes.PortMap{
+					networktypes.MustParsePort("80/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "1.2.3.4",
+							HostIP:   netip.MustParseAddr("1.2.3.4"),
 							HostPort: "8081",
 						},
 					},
-					"443/tcp": []nat.PortBinding{
+					networktypes.MustParsePort("443/tcp"): []networktypes.PortBinding{
 						{
-							HostIP:   "5.6.7.8",
+							HostIP:   netip.MustParseAddr("5.6.7.8"),
 							HostPort: "8082",
 						},
 					},
@@ -3235,18 +4545,17 @@ func TestDockerGetIPPort(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			dData := parseContainer(test.container)
 
-			provider := &Provider{
+			builder := NewDynConfBuilder(Shared{
 				Network:       "testnet",
 				UseBindPortIP: true,
-			}
+			}, nil, false)
 
-			actualIP, actualPort, actualError := provider.getIPPort(context.Background(), dData, test.serverPort)
+			actualIP, actualPort, actualError := builder.getIPPort(t.Context(), dData, test.serverPort)
 			if test.expected.error {
 				require.Error(t, actualError)
 			} else {
@@ -3258,77 +4567,12 @@ func TestDockerGetIPPort(t *testing.T) {
 	}
 }
 
-func TestDockerGetPort(t *testing.T) {
-	testCases := []struct {
-		desc       string
-		container  docker.ContainerJSON
-		serverPort string
-		expected   string
-	}{
-		{
-			desc:      "no binding, no server port label",
-			container: containerJSON(name("foo")),
-			expected:  "",
-		},
-		{
-			desc: "binding, no server port label",
-			container: containerJSON(ports(nat.PortMap{
-				"80/tcp": {},
-			})),
-			expected: "80",
-		},
-		{
-			desc: "binding, multiple ports, no server port label",
-			container: containerJSON(ports(nat.PortMap{
-				"80/tcp":  {},
-				"443/tcp": {},
-			})),
-			expected: "80",
-		},
-		{
-			desc:       "no binding, server port label",
-			container:  containerJSON(),
-			serverPort: "8080",
-			expected:   "8080",
-		},
-		{
-			desc: "binding, server port label",
-			container: containerJSON(
-				ports(nat.PortMap{
-					"80/tcp": {},
-				})),
-			serverPort: "8080",
-			expected:   "8080",
-		},
-		{
-			desc: "binding, multiple ports, server port label",
-			container: containerJSON(ports(nat.PortMap{
-				"8080/tcp": {},
-				"80/tcp":   {},
-			})),
-			serverPort: "8080",
-			expected:   "8080",
-		},
-	}
-
-	for _, test := range testCases {
-		test := test
-		t.Run(test.desc, func(t *testing.T) {
-			t.Parallel()
-
-			dData := parseContainer(test.container)
-
-			actual := getPort(dData, test.serverPort)
-			assert.Equal(t, test.expected, actual)
-		})
-	}
-}
-
-func TestDockerGetIPAddress(t *testing.T) {
+func TestDynConfBuilder_getIPAddress_docker(t *testing.T) {
 	testCases := []struct {
 		desc      string
-		container docker.ContainerJSON
+		container containertypes.InspectResponse
 		network   string
+		nodeIP    string
 		expected  string
 	}{
 		{
@@ -3340,6 +4584,22 @@ func TestDockerGetIPAddress(t *testing.T) {
 			desc: "one network, network label",
 			container: containerJSON(
 				withNetwork("testnet", ipv4("10.11.12.13")),
+			),
+			network:  "testnet",
+			expected: "10.11.12.13",
+		},
+		{
+			desc: "one ipv6 network, network label",
+			container: containerJSON(
+				withNetwork("testnet", ipv6("fd00:1:2:3:4::")),
+			),
+			network:  "testnet",
+			expected: "fd00:1:2:3:4::",
+		},
+		{
+			desc: "two network ipv4 + ipv6, network label",
+			container: containerJSON(
+				withNetwork("testnet", ipv4("10.11.12.13"), ipv6("fd00:1:2:3:4::")),
 			),
 			network:  "testnet",
 			expected: "10.11.12.13",
@@ -3388,47 +4648,51 @@ func TestDockerGetIPAddress(t *testing.T) {
 			expected: "127.0.0.1",
 		},
 		{
-			desc: "no network, no network label, mode host, node IP",
+			desc:   "no network, no network label, mode host, node IP",
+			nodeIP: "10.0.0.5",
 			container: containerJSON(
 				networkMode("host"),
-				nodeIP("10.0.0.5"),
 			),
 			expected: "10.0.0.5",
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			provider := &Provider{
+			conf := Shared{
 				Network: "webnet",
 			}
 
 			dData := parseContainer(test.container)
-
-			dData.ExtraConf.Docker.Network = provider.Network
-			if len(test.network) > 0 {
-				dData.ExtraConf.Docker.Network = test.network
+			if test.nodeIP != "" {
+				dData.NodeIP = test.nodeIP
 			}
 
-			actual := provider.getIPAddress(context.Background(), dData)
+			dData.ExtraConf.Network = conf.Network
+			if len(test.network) > 0 {
+				dData.ExtraConf.Network = test.network
+			}
+
+			builder := NewDynConfBuilder(conf, nil, false)
+
+			actual := builder.getIPAddress(t.Context(), dData)
 			assert.Equal(t, test.expected, actual)
 		})
 	}
 }
 
-func TestSwarmGetIPAddress(t *testing.T) {
+func TestDynConfBuilder_getIPAddress_swarm(t *testing.T) {
 	testCases := []struct {
-		service  swarm.Service
+		service  swarmtypes.Service
 		expected string
-		networks map[string]*docker.NetworkResource
+		networks map[string]*networktypes.Summary
 	}{
 		{
-			service:  swarmService(withEndpointSpec(modeDNSSR)),
+			service:  swarmService(withEndpointSpec(modeDNSRR)),
 			expected: "",
-			networks: map[string]*docker.NetworkResource{},
+			networks: map[string]*networktypes.Summary{},
 		},
 		{
 			service: swarmService(
@@ -3436,16 +4700,16 @@ func TestSwarmGetIPAddress(t *testing.T) {
 				withEndpoint(virtualIP("1", "10.11.12.13/24")),
 			),
 			expected: "10.11.12.13",
-			networks: map[string]*docker.NetworkResource{
+			networks: map[string]*networktypes.Summary{
 				"1": {
-					Name: "foo",
+					Network: networktypes.Network{Name: "foo"},
 				},
 			},
 		},
 		{
 			service: swarmService(
 				serviceLabels(map[string]string{
-					"traefik.docker.network": "barnet",
+					"traefik.swarm.network": "barnet",
 				}),
 				withEndpointSpec(modeVIP),
 				withEndpoint(
@@ -3454,63 +4718,29 @@ func TestSwarmGetIPAddress(t *testing.T) {
 				),
 			),
 			expected: "10.11.12.99",
-			networks: map[string]*docker.NetworkResource{
+			networks: map[string]*networktypes.Summary{
 				"1": {
-					Name: "foonet",
+					Network: networktypes.Network{Name: "foonet"},
 				},
 				"2": {
-					Name: "barnet",
+					Network: networktypes.Network{Name: "barnet"},
 				},
 			},
 		},
 	}
 
 	for serviceID, test := range testCases {
-		test := test
 		t.Run(strconv.Itoa(serviceID), func(t *testing.T) {
 			t.Parallel()
 
-			provider := &Provider{
-				SwarmMode: true,
-			}
+			var p SwarmProvider
+			require.NoError(t, p.Init())
 
-			dData, err := provider.parseService(context.Background(), test.service, test.networks)
+			dData, err := p.parseService(t.Context(), test.service, test.networks)
 			require.NoError(t, err)
 
-			actual := provider.getIPAddress(context.Background(), dData)
-			assert.Equal(t, test.expected, actual)
-		})
-	}
-}
-
-func TestSwarmGetPort(t *testing.T) {
-	testCases := []struct {
-		service    swarm.Service
-		serverPort string
-		networks   map[string]*docker.NetworkResource
-		expected   string
-	}{
-		{
-			service: swarmService(
-				withEndpointSpec(modeDNSSR),
-			),
-			networks:   map[string]*docker.NetworkResource{},
-			serverPort: "8080",
-			expected:   "8080",
-		},
-	}
-
-	for serviceID, test := range testCases {
-		test := test
-		t.Run(strconv.Itoa(serviceID), func(t *testing.T) {
-			t.Parallel()
-
-			p := Provider{}
-
-			dData, err := p.parseService(context.Background(), test.service, test.networks)
-			require.NoError(t, err)
-
-			actual := getPort(dData, test.serverPort)
+			builder := NewDynConfBuilder(p.Shared, nil, false)
+			actual := builder.getIPAddress(t.Context(), dData)
 			assert.Equal(t, test.expected, actual)
 		})
 	}

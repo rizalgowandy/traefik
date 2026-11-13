@@ -1,7 +1,6 @@
 package passtlsclientcert
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -15,8 +14,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/testhelpers"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/testhelpers"
 )
 
 const (
@@ -310,17 +309,16 @@ func TestPassTLSClientCert_PEM(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			tlsClientHeaders, err := New(context.Background(), next, test.config, "foo")
+			tlsClientHeaders, err := New(t.Context(), next, test.config, "foo")
 			require.NoError(t, err)
 
 			res := httptest.NewRecorder()
 			req := testhelpers.MustNewRequest(http.MethodGet, "http://example.com/foo", nil)
 
-			if test.certContents != nil && len(test.certContents) > 0 {
+			if len(test.certContents) > 0 {
 				req.TLS = buildTLSWith(test.certContents)
 			}
 
@@ -376,7 +374,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 			desc: "No TLS, with subject info",
 			config: dynamic.PassTLSClientCert{
 				Info: &dynamic.TLSClientCertificateInfo{
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{
 						CommonName:         true,
 						Organization:       true,
 						OrganizationalUnit: true,
@@ -393,7 +391,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 			config: dynamic.PassTLSClientCert{
 				PEM: false,
 				Info: &dynamic.TLSClientCertificateInfo{
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{},
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{},
 				},
 			},
 		},
@@ -406,7 +404,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 					NotBefore:    true,
 					Sans:         true,
 					SerialNumber: true,
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{
 						CommonName:         true,
 						Country:            true,
 						DomainComponent:    true,
@@ -416,7 +414,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 						Province:           true,
 						SerialNumber:       true,
 					},
-					Issuer: &dynamic.TLSCLientCertificateIssuerDNInfo{
+					Issuer: &dynamic.TLSClientCertificateIssuerDNInfo{
 						CommonName:      true,
 						Country:         true,
 						DomainComponent: true,
@@ -436,10 +434,10 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 				Info: &dynamic.TLSClientCertificateInfo{
 					NotAfter: true,
 					Sans:     true,
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{
 						Organization: true,
 					},
-					Issuer: &dynamic.TLSCLientCertificateIssuerDNInfo{
+					Issuer: &dynamic.TLSClientCertificateIssuerDNInfo{
 						Country: true,
 					},
 				},
@@ -453,13 +451,13 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 				Info: &dynamic.TLSClientCertificateInfo{
 					NotAfter: true,
 					Sans:     true,
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{
 						Organization: true,
 						// OrganizationalUnit is not set on this example certificate,
 						// so even though it's requested, it will be absent.
 						OrganizationalUnit: true,
 					},
-					Issuer: &dynamic.TLSCLientCertificateIssuerDNInfo{
+					Issuer: &dynamic.TLSClientCertificateIssuerDNInfo{
 						Country: true,
 					},
 				},
@@ -475,7 +473,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 					NotBefore:    true,
 					Sans:         true,
 					SerialNumber: true,
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{
 						Country:            true,
 						Province:           true,
 						Locality:           true,
@@ -485,7 +483,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 						SerialNumber:       true,
 						DomainComponent:    true,
 					},
-					Issuer: &dynamic.TLSCLientCertificateIssuerDNInfo{
+					Issuer: &dynamic.TLSClientCertificateIssuerDNInfo{
 						Country:         true,
 						Province:        true,
 						Locality:        true,
@@ -507,7 +505,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 					NotBefore:    true,
 					Sans:         true,
 					SerialNumber: true,
-					Subject: &dynamic.TLSCLientCertificateSubjectDNInfo{
+					Subject: &dynamic.TLSClientCertificateSubjectDNInfo{
 						Country:            true,
 						Province:           true,
 						Locality:           true,
@@ -517,7 +515,7 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 						SerialNumber:       true,
 						DomainComponent:    true,
 					},
-					Issuer: &dynamic.TLSCLientCertificateIssuerDNInfo{
+					Issuer: &dynamic.TLSClientCertificateIssuerDNInfo{
 						Country:         true,
 						Province:        true,
 						Locality:        true,
@@ -533,17 +531,16 @@ func TestPassTLSClientCert_certInfo(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			tlsClientHeaders, err := New(context.Background(), next, test.config, "foo")
+			tlsClientHeaders, err := New(t.Context(), next, test.config, "foo")
 			require.NoError(t, err)
 
 			res := httptest.NewRecorder()
 			req := testhelpers.MustNewRequest(http.MethodGet, "http://example.com/foo", nil)
 
-			if test.certContents != nil && len(test.certContents) > 0 {
+			if len(test.certContents) > 0 {
 				req.TLS = buildTLSWith(test.certContents)
 			}
 
@@ -604,13 +601,12 @@ WqeUSNGYV//RunTeuRDAf5OxehERb1srzBXhRZ3cZdzXbgR/`,
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			content := sanitize(test.toSanitize)
 
-			expected := url.QueryEscape(strings.ReplaceAll(test.expected, "\n", ""))
+			expected := strings.ReplaceAll(test.expected, "\n", "")
 			assert.Equal(t, expected, content, "The sanitized certificates should be equal")
 		})
 	}
@@ -645,7 +641,6 @@ func Test_getSANs(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 

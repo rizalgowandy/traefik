@@ -4,16 +4,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/networking/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	netv1 "k8s.io/api/networking/v1"
 )
 
 func Test_detectChanges(t *testing.T) {
 	tests := []struct {
 		name   string
-		oldObj interface{}
-		newObj interface{}
+		oldObj any
+		newObj any
 		want   bool
 	}{
 		{
@@ -21,493 +20,278 @@ func Test_detectChanges(t *testing.T) {
 			want: true,
 		},
 		{
-			name:   "With empty endpoints",
-			oldObj: &corev1.Endpoints{},
-			newObj: &corev1.Endpoints{},
+			name:   "With empty endpointslice",
+			oldObj: &discoveryv1.EndpointSlice{},
+			newObj: &discoveryv1.EndpointSlice{},
 		},
 		{
 			name:   "With old nil",
-			newObj: &corev1.Endpoints{},
+			newObj: &discoveryv1.EndpointSlice{},
 			want:   true,
 		},
 		{
 			name:   "With new nil",
-			oldObj: &corev1.Endpoints{},
+			oldObj: &discoveryv1.EndpointSlice{},
 			want:   true,
 		},
 		{
 			name: "With same version",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
 			},
 		},
 		{
 			name: "With different version",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
 			},
 		},
 		{
 			name: "Ingress With same version",
-			oldObj: &v1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
+			oldObj: &netv1.Ingress{
+				ResourceVersion: "1",
 			},
-			newObj: &v1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
+			newObj: &netv1.Ingress{
+				ResourceVersion: "1",
 			},
 		},
 		{
 			name: "Ingress With different version",
-			oldObj: &v1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
+			oldObj: &netv1.Ingress{
+				ResourceVersion: "1",
 			},
-			newObj: &v1.Ingress{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
+			newObj: &netv1.Ingress{
+				ResourceVersion: "2",
 			},
 			want: true,
 		},
 		{
 			name: "With same annotations",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-					Annotations: map[string]string{
-						"test-annotation": "_",
-					},
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Annotations: map[string]string{
+					"test-annotation": "_",
 				},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-					Annotations: map[string]string{
-						"test-annotation": "_",
-					},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Annotations: map[string]string{
+					"test-annotation": "_",
 				},
 			},
 		},
 		{
 			name: "With different annotations",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-					Annotations: map[string]string{
-						"test-annotation": "V",
-					},
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Annotations: map[string]string{
+					"test-annotation": "V",
 				},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-					Annotations: map[string]string{
-						"test-annotation": "X",
-					},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Annotations: map[string]string{
+					"test-annotation": "X",
 				},
 			},
 		},
 		{
-			name: "With same subsets",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{},
+			name: "With same endpoints and ports",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints:       []discoveryv1.Endpoint{},
+				Ports:           []discoveryv1.EndpointPort{},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints:       []discoveryv1.Endpoint{},
+				Ports:           []discoveryv1.EndpointPort{},
 			},
 		},
 		{
-			name: "With different len of subsets",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{},
+			name: "With different len of endpoints",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints:       []discoveryv1.Endpoint{},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints:       []discoveryv1.Endpoint{{}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of addresses",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{},
+			name: "With different endpoints",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.10.10.10"},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{},
-				}},
-			},
-		},
-		{
-			name: "With same subsets with different len of addresses",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{},
-				}},
-			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.10.10.11"},
 				}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of ports",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{},
+			name: "With different endpoint ready condition",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Ready: new(true)},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{},
-				}},
-			},
-		},
-		{
-			name: "With same subsets with different len of ports",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{},
-				}},
-			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Ready: new(false)},
 				}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of addresses with same ip",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						IP: "10.10.10.10",
-					}},
+			name: "With different endpoint serving condition",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Serving: new(true)},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						IP: "10.10.10.10",
-					}},
-				}},
-			},
-		},
-		{
-			name: "With same subsets with same len of addresses with different ip",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						IP: "10.10.10.10",
-					}},
-				}},
-			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						IP: "10.10.10.42",
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Serving: new(false)},
 				}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of addresses with same hostname",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						Hostname: "foo",
-					}},
+			name: "With different endpoint terminating condition",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Terminating: new(false)},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						Hostname: "foo",
-					}},
-				}},
-			},
-		},
-		{
-			name: "With same subsets with same len of addresses with same hostname",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						Hostname: "foo",
-					}},
-				}},
-			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						Hostname: "bar",
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Terminating: new(true)},
 				}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of port with same name",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Name: "foo",
-					}},
+			name: "With endpoint serving condition nil then explicitly true",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.10.10.10"},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Name: "foo",
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Serving: new(true)},
 				}},
 			},
 		},
 		{
-			name: "With same subsets with same len of port with different name",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Name: "foo",
-					}},
+			name: "With endpoint serving condition nil then explicitly false",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.10.10.10"},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Name: "bar",
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Serving: new(false)},
 				}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of port with same port",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Port: 4242,
-					}},
+			name: "With endpoint terminating condition nil then explicitly false",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.10.10.10"},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Port: 4242,
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Terminating: new(false)},
 				}},
 			},
 		},
 		{
-			name: "With same subsets with same len of port with different port",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Port: 4242,
-					}},
+			name: "With endpoint terminating condition nil then explicitly true",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.10.10.10"},
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Port: 6969,
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"10.10.10.10"},
+					Conditions: discoveryv1.EndpointConditions{Terminating: new(true)},
 				}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same len of port with same protocol",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Protocol: "HTTP",
-					}},
-				}},
+			name: "With different len of ports",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Ports:           []discoveryv1.EndpointPort{},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Protocol: "HTTP",
-					}},
-				}},
-			},
-		},
-		{
-			name: "With same subsets with same len of port with different protocol",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Protocol: "HTTP",
-					}},
-				}},
-			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Ports: []corev1.EndpointPort{{
-						Protocol: "TCP",
-					}},
-				}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Ports:           []discoveryv1.EndpointPort{{}},
 			},
 			want: true,
 		},
 		{
-			name: "With same subsets with same subset",
-			oldObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "1",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						IP:       "10.10.10.10",
-						Hostname: "foo",
-					}},
-					Ports: []corev1.EndpointPort{{
-						Name:     "bar",
-						Port:     4242,
-						Protocol: "HTTP",
-					}},
+			name: "With different ports",
+			oldObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "1",
+				Ports: []discoveryv1.EndpointPort{{
+					Port: new(int32(80)),
 				}},
 			},
-			newObj: &corev1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					ResourceVersion: "2",
-				},
-				Subsets: []corev1.EndpointSubset{{
-					Addresses: []corev1.EndpointAddress{{
-						IP:       "10.10.10.10",
-						Hostname: "foo",
-					}},
-					Ports: []corev1.EndpointPort{{
-						Name:     "bar",
-						Port:     4242,
-						Protocol: "HTTP",
-					}},
+			newObj: &discoveryv1.EndpointSlice{
+				ResourceVersion: "2",
+				Ports: []discoveryv1.EndpointPort{{
+					Port: new(int32(8080)),
 				}},
 			},
+			want: true,
 		},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 

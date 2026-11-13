@@ -4,17 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
 )
 
 type udpRouterRepresentation struct {
 	*runtime.UDPRouterInfo
+
 	Name     string `json:"name,omitempty"`
 	Provider string `json:"provider,omitempty"`
 }
@@ -29,6 +30,7 @@ func newUDPRouterRepresentation(name string, rt *runtime.UDPRouterInfo) udpRoute
 
 type udpServiceRepresentation struct {
 	*runtime.UDPServiceInfo
+
 	Name     string `json:"name,omitempty"`
 	Provider string `json:"provider,omitempty"`
 	Type     string `json:"type,omitempty"`
@@ -43,10 +45,11 @@ func newUDPServiceRepresentation(name string, si *runtime.UDPServiceInfo) udpSer
 	}
 }
 
-func (h Handler) getUDPRouters(rw http.ResponseWriter, request *http.Request) {
+func (h *Handler) getUDPRouters(rw http.ResponseWriter, request *http.Request) {
 	results := make([]udpRouterRepresentation, 0, len(h.runtimeConfiguration.UDPRouters))
 
-	criterion := newSearchCriterion(request.URL.Query())
+	query := request.URL.Query()
+	criterion := newSearchCriterion(query)
 
 	for name, rt := range h.runtimeConfiguration.UDPRouters {
 		if keepUDPRouter(name, rt, criterion) {
@@ -54,9 +57,7 @@ func (h Handler) getUDPRouters(rw http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Name < results[j].Name
-	})
+	sortRouters(query, results)
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -70,13 +71,19 @@ func (h Handler) getUDPRouters(rw http.ResponseWriter, request *http.Request) {
 
 	err = json.NewEncoder(rw).Encode(results[pageInfo.startIndex:pageInfo.endIndex])
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getUDPRouter(rw http.ResponseWriter, request *http.Request) {
-	routerID := mux.Vars(request)["routerID"]
+func (h *Handler) getUDPRouter(rw http.ResponseWriter, request *http.Request) {
+	scapedRouterID := mux.Vars(request)["routerID"]
+
+	routerID, err := url.PathUnescape(scapedRouterID)
+	if err != nil {
+		writeError(rw, fmt.Sprintf("unable to decode routerID %q: %s", scapedRouterID, err), http.StatusBadRequest)
+		return
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -88,17 +95,18 @@ func (h Handler) getUDPRouter(rw http.ResponseWriter, request *http.Request) {
 
 	result := newUDPRouterRepresentation(routerID, router)
 
-	err := json.NewEncoder(rw).Encode(result)
+	err = json.NewEncoder(rw).Encode(result)
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getUDPServices(rw http.ResponseWriter, request *http.Request) {
+func (h *Handler) getUDPServices(rw http.ResponseWriter, request *http.Request) {
 	results := make([]udpServiceRepresentation, 0, len(h.runtimeConfiguration.UDPServices))
 
-	criterion := newSearchCriterion(request.URL.Query())
+	query := request.URL.Query()
+	criterion := newSearchCriterion(query)
 
 	for name, si := range h.runtimeConfiguration.UDPServices {
 		if keepUDPService(name, si, criterion) {
@@ -106,9 +114,7 @@ func (h Handler) getUDPServices(rw http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Name < results[j].Name
-	})
+	sortServices(query, results)
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -122,13 +128,19 @@ func (h Handler) getUDPServices(rw http.ResponseWriter, request *http.Request) {
 
 	err = json.NewEncoder(rw).Encode(results[pageInfo.startIndex:pageInfo.endIndex])
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getUDPService(rw http.ResponseWriter, request *http.Request) {
-	serviceID := mux.Vars(request)["serviceID"]
+func (h *Handler) getUDPService(rw http.ResponseWriter, request *http.Request) {
+	scapedServiceID := mux.Vars(request)["serviceID"]
+
+	serviceID, err := url.PathUnescape(scapedServiceID)
+	if err != nil {
+		writeError(rw, fmt.Sprintf("unable to decode serviceID %q: %s", scapedServiceID, err), http.StatusBadRequest)
+		return
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -140,9 +152,9 @@ func (h Handler) getUDPService(rw http.ResponseWriter, request *http.Request) {
 
 	result := newUDPServiceRepresentation(serviceID, service)
 
-	err := json.NewEncoder(rw).Encode(result)
+	err = json.NewEncoder(rw).Encode(result)
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -152,7 +164,9 @@ func keepUDPRouter(name string, item *runtime.UDPRouterInfo, criterion *searchCr
 		return true
 	}
 
-	return criterion.withStatus(item.Status) && criterion.searchIn(name)
+	return criterion.withStatus(item.Status) &&
+		criterion.searchIn(name) &&
+		criterion.filterService(item.Service)
 }
 
 func keepUDPService(name string, item *runtime.UDPServiceInfo, criterion *searchCriterion) bool {

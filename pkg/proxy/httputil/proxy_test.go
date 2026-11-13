@@ -1,0 +1,332 @@
+package httputil
+
+import (
+	"crypto/tls"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/traefik/traefik/v3/pkg/testhelpers"
+)
+
+func Test_rewriteRequestBuilder(t *testing.T) {
+	tests := []struct {
+		name            string
+		target          *url.URL
+		passHostHeader  bool
+		preservePath    bool
+		incomingURL     string
+		expectedScheme  string
+		expectedHost    string
+		expectedPath    string
+		expectedRawPath string
+		expectedQuery   string
+		notAppendXFF    bool
+	}{
+		{
+			name:           "Basic proxy",
+			target:         testhelpers.MustParseURL("http://example.com"),
+			passHostHeader: false,
+			preservePath:   false,
+			incomingURL:    "http://localhost/test?param=value",
+			expectedScheme: "http",
+			expectedHost:   "example.com",
+			expectedPath:   "/test",
+			expectedQuery:  "param=value",
+		},
+		{
+			name:           "Basic proxy - notAppendXFF",
+			target:         testhelpers.MustParseURL("http://example.com"),
+			passHostHeader: false,
+			preservePath:   false,
+			incomingURL:    "http://localhost/test?param=value",
+			expectedScheme: "http",
+			expectedHost:   "example.com",
+			expectedPath:   "/test",
+			expectedQuery:  "param=value",
+			notAppendXFF:   true,
+		},
+		{
+			name:           "HTTPS target",
+			target:         testhelpers.MustParseURL("https://secure.example.com"),
+			passHostHeader: false,
+			preservePath:   false,
+			incomingURL:    "http://localhost/secure",
+			expectedScheme: "https",
+			expectedHost:   "secure.example.com",
+			expectedPath:   "/secure",
+		},
+		{
+			name:           "PassHostHeader",
+			target:         testhelpers.MustParseURL("http://example.com"),
+			passHostHeader: true,
+			preservePath:   false,
+			incomingURL:    "http://original.host/test",
+			expectedScheme: "http",
+			expectedHost:   "original.host",
+			expectedPath:   "/test",
+		},
+		{
+			name:            "Preserve path",
+			target:          testhelpers.MustParseURL("http://example.com/base"),
+			passHostHeader:  false,
+			preservePath:    true,
+			incomingURL:     "http://localhost/foo%2Fbar",
+			expectedScheme:  "http",
+			expectedHost:    "example.com",
+			expectedPath:    "/base/foo/bar",
+			expectedRawPath: "/base/foo%2Fbar",
+		},
+		{
+			name:           "Handle semicolons in query",
+			target:         testhelpers.MustParseURL("http://example.com"),
+			passHostHeader: false,
+			preservePath:   false,
+			incomingURL:    "http://localhost/test?param1=value1;param2=value2",
+			expectedScheme: "http",
+			expectedHost:   "example.com",
+			expectedPath:   "/test",
+			expectedQuery:  "param1=value1&param2=value2",
+		},
+		{
+			name:           "Opaque incoming URL",
+			target:         testhelpers.MustParseURL("http://example.com"),
+			passHostHeader: false,
+			preservePath:   false,
+			incomingURL:    "http:evil.example.com/admin",
+			expectedScheme: "http",
+			expectedHost:   "example.com",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			rewriteRequest := rewriteRequestBuilder(test.target, test.passHostHeader, test.preservePath)
+
+			ctx := t.Context()
+			if test.notAppendXFF {
+				ctx = SetNotAppendXFF(ctx)
+			}
+
+			reqIn := httptest.NewRequest(http.MethodGet, test.incomingURL, http.NoBody)
+			reqIn = reqIn.WithContext(ctx)
+			reqIn.Header.Add("X-Forwarded-For", "1.2.3.4")
+			reqIn.RemoteAddr = "127.0.0.1:1234"
+
+			reqOut := httptest.NewRequest(http.MethodGet, test.incomingURL, http.NoBody)
+			pr := &httputil.ProxyRequest{
+				In:  reqIn,
+				Out: reqOut,
+			}
+			rewriteRequest(pr)
+
+			if test.notAppendXFF {
+				assert.Equal(t, "1.2.3.4", reqOut.Header.Get("X-Forwarded-For"))
+			} else {
+				// When not disabled, X-Forwarded-For should have RemoteAddr appended
+				assert.Equal(t, "1.2.3.4, 127.0.0.1", reqOut.Header.Get("X-Forwarded-For"))
+			}
+			assert.Equal(t, test.expectedScheme, reqOut.URL.Scheme)
+			assert.Equal(t, test.expectedHost, reqOut.Host)
+			assert.Equal(t, test.expectedPath, reqOut.URL.Path)
+			assert.Equal(t, test.expectedRawPath, reqOut.URL.RawPath)
+			assert.Equal(t, test.expectedQuery, reqOut.URL.RawQuery)
+			assert.Empty(t, reqOut.URL.Opaque)
+			assert.Empty(t, reqOut.RequestURI)
+			assert.Equal(t, "HTTP/1.1", reqOut.Proto)
+			assert.Equal(t, 1, reqOut.ProtoMajor)
+			assert.Equal(t, 1, reqOut.ProtoMinor)
+			assert.False(t, !test.passHostHeader && reqOut.Host != reqOut.URL.Host)
+		})
+	}
+}
+
+func TestProxy_ConnectRejected(t *testing.T) {
+	testCases := []struct {
+		desc  string
+		http2 bool
+	}{
+		{
+			desc: "HTTP/1.1",
+		},
+		{
+			desc:  "HTTP/2",
+			http2: true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			var backendCalled atomic.Bool
+			backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				backendCalled.Store(true)
+			}))
+			t.Cleanup(backend.Close)
+
+			backendURL, err := url.Parse(backend.URL)
+			require.NoError(t, err)
+
+			proxy := buildSingleHostProxy(backendURL, true, false, 0, http.DefaultTransport, newBufferPool())
+
+			serverProtocols := new(http.Protocols)
+			serverProtocols.SetHTTP1(true)
+			serverProtocols.SetUnencryptedHTTP2(true)
+
+			srv := httptest.NewUnstartedServer(proxy)
+			srv.Config.Protocols = serverProtocols
+			srv.Start()
+			t.Cleanup(srv.Close)
+
+			clientProtocols := new(http.Protocols)
+			if test.http2 {
+				clientProtocols.SetUnencryptedHTTP2(true)
+			} else {
+				clientProtocols.SetHTTP1(true)
+			}
+			transport := &http.Transport{Protocols: clientProtocols}
+			t.Cleanup(transport.CloseIdleConnections)
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodConnect, srv.URL, strings.NewReader("foo"))
+			require.NoError(t, err)
+
+			res, err := transport.RoundTrip(req)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = res.Body.Close() })
+
+			if test.http2 {
+				assert.Equal(t, 2, res.ProtoMajor)
+			} else {
+				assert.Equal(t, 1, res.ProtoMajor)
+			}
+			assert.Equal(t, http.StatusInternalServerError, res.StatusCode)
+			assert.False(t, backendCalled.Load())
+		})
+	}
+}
+
+func Test_isTLSConfigError(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		err      error
+		expected bool
+	}{
+		{
+			desc: "nil",
+		},
+		{
+			desc: "TLS ECHRejectionError",
+			err:  &tls.ECHRejectionError{},
+		},
+		{
+			desc: "TLS AlertError",
+			err:  tls.AlertError(0),
+		},
+		{
+			desc: "Random error",
+			err:  errors.New("random error"),
+		},
+		{
+			desc:     "TLS RecordHeaderError",
+			err:      tls.RecordHeaderError{},
+			expected: true,
+		},
+		{
+			desc:     "TLS CertificateVerificationError",
+			err:      &tls.CertificateVerificationError{},
+			expected: true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			actual := isTLSConfigError(test.err)
+			require.Equal(t, test.expected, actual)
+		})
+	}
+}
+
+// TestBidirectionalStreamEndedByBackend ensures that when a backend ends an HTTP/2 stream while
+// the client is still sending its request body, as gRPC does when a bidirectional streaming call
+// fails on the server side, the client receives the end of the response and its trailers.
+func TestBidirectionalStreamEndedByBackend(t *testing.T) {
+	h2cProtocols := new(http.Protocols)
+	h2cProtocols.SetUnencryptedHTTP2(true)
+
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		_, err := io.ReadFull(req.Body, make([]byte, 5))
+		require.NoError(t, err)
+
+		rw.Header().Set("Trailer", "Grpc-Status")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("reply"))
+		rw.Header().Set("Grpc-Status", "13")
+	}))
+	backend.Config.Protocols = h2cProtocols
+	backend.Start()
+	t.Cleanup(backend.Close)
+
+	backendTransport := &http.Transport{Protocols: h2cProtocols}
+	transportManager := &transportManagerMock{
+		roundTrippers: map[string]http.RoundTripper{"default": backendTransport},
+	}
+
+	p, err := NewProxyBuilder(transportManager, nil).Build("default", testhelpers.MustParseURL(backend.URL), true, false, -1)
+	require.NoError(t, err)
+
+	proxy := httptest.NewUnstartedServer(p)
+	proxy.Config.Protocols = h2cProtocols
+	proxy.Start()
+	t.Cleanup(proxy.Close)
+
+	// The request body is left open for the whole call, so only the backend can end the stream.
+	bodyReader, bodyWriter := io.Pipe()
+	t.Cleanup(func() { _ = bodyWriter.Close() })
+
+	go func() { _, _ = bodyWriter.Write([]byte("hello")) }()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxy.URL, bodyReader)
+	require.NoError(t, err)
+
+	type result struct {
+		body    []byte
+		trailer http.Header
+		err     error
+	}
+
+	resultCh := make(chan result, 1)
+	go func() {
+		res, err := (&http.Transport{Protocols: h2cProtocols}).RoundTrip(req)
+		if err != nil {
+			resultCh <- result{err: err}
+			return
+		}
+		defer res.Body.Close()
+
+		body, err := io.ReadAll(res.Body)
+		resultCh <- result{body: body, trailer: res.Trailer, err: err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		require.NoError(t, res.err)
+		assert.Equal(t, "reply", string(res.body))
+		assert.Equal(t, "13", res.trailer.Get("Grpc-Status"))
+	case <-time.After(5 * time.Second):
+		t.Fatal("The end of the stream was not forwarded to the client")
+	}
+}

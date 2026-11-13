@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
 )
 
 type routineCtx func(ctx context.Context)
@@ -49,7 +49,7 @@ func Go(goroutine func()) {
 }
 
 // GoWithRecover starts a recoverable goroutine using given customRecover() function.
-func GoWithRecover(goroutine func(), customRecover func(err interface{})) {
+func GoWithRecover(goroutine func(), customRecover func(err any)) {
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
@@ -60,10 +60,9 @@ func GoWithRecover(goroutine func(), customRecover func(err interface{})) {
 	}()
 }
 
-func defaultRecoverGoroutine(err interface{}) {
-	logger := log.WithoutContext()
-	logger.Errorf("Error in Go routine: %s", err)
-	logger.Errorf("Stack: %s", debug.Stack())
+func defaultRecoverGoroutine(err any) {
+	log.Error().Interface("error", err).Msg("Error in Go routine")
+	log.Error().Msgf("Stack: %s", debug.Stack())
 }
 
 // OperationWithRecover wrap a backoff operation in a Recover.

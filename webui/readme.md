@@ -11,54 +11,66 @@ Traefik Web UI provide 2 types of information:
 
 ## How to build (for backend developer)
 
-Use the make file :
+Use the Makefile :
 
 ```shell
-make build-image      # Generate Docker image
-make generate-webui   # Generate static contents in `traefik/webui/static/` folder.
+make build-image                # Generate Docker image.
+make clean-webui generate-webui # Generate static contents in `webui/static/` folder.
 ```
 
 ## How to build (only for frontend developer)
 
-- prerequisite: [Node 12.11+](https://nodejs.org) [Npm](https://www.npmjs.com/)
+- prerequisite: [Node 26](https://nodejs.org) [Yarn](https://yarnpkg.com/)
 
-- Go to the `webui` directory
+- Go to the `webui/` directory
+
+- As we use Yarn v4, you will need to install corepack before installing dependencies:
+
+  - `npm i -g corepack@0.36.0 --ignore-scripts`
 
 - To install dependencies, execute the following commands:
 
-  - `npm install`
+  - `yarn install`
 
 - Build static Web UI, execute the following command:
 
-  - `npm run build`
+  - `yarn build`
 
-- Static contents are built in the `webui/static` directory
+- Static contents are built in the `webui/static/` directory
 
-**Do not manually change the files in the `webui/static` directory**
+**Do not manually change the files in the `webui/static/` directory**
 
-- The build allows to:
+The build allows to:
   - optimize all JavaScript
   - optimize all CSS
-  - add vendor prefixes to CSS (cross-bowser support)
+  - add vendor prefixes to CSS (cross-browser support)
   - add a hash in the file names to prevent browser cache problems
   - optimize all images at build time
   - bundle JavaScript in one file
 
 ## How to edit (only for frontend developer)
 
-**Do not manually change the files in the `webui/static` directory**
+**Do not manually change the files in the `webui/static/` directory**
 
-- Go to the `webui` directory
-- Edit files in `webui/src`
+- Go to the `webui/` directory
+- Edit files in `webui/src/`
+- Create and populate the `.env` file using the values inside `.env.sample` file.
 - Run in development mode :
-  - `npm run dev`
+  - `yarn dev`
+- The application will be available at `http://localhost:3000/`. On development mode, the application will run with mocked data served by [Mock Service Worker](https://mswjs.io/).
+
+## How to run tests
+
+- Execute the following commands:
+  - `yarn test`
+  - or `yarn test:watch` if you want them in watch mode
 
 ## Libraries
 
 - [Node](https://nodejs.org)
-- [Npm](https://www.npmjs.com/)
-- [Webpack](https://github.com/webpack/webpack)
-- [Vue](https://vuejs.org/)
-- [Bulma](https://bulma.io)
-- [D3](https://d3js.org)
-- [D3 - Documentation](https://github.com/mbostock/d3/wiki)
+- [Yarn](https://yarnpkg.com/)
+- [React](https://reactjs.org/)
+- [Vite](https://vitejs.dev/)
+- [Faency](https://github.com/containous/faency)
+- [Vitest](https://vitest.dev/)
+- [Mock Service Worker](https://mswjs.io/)

@@ -1,7 +1,6 @@
 package file
 
 import (
-	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,8 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/safe"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/safe"
 )
 
 type ProvideTestCase struct {
@@ -54,13 +53,20 @@ func TestTLSCertificateContent(t *testing.T) {
   [[http.serversTransports.default.certificates]]
     certFile = "` + fileTLS.Name() + `"
     keyFile = "` + fileTLSKey.Name() + `"
+
+[tcp.serversTransports.default]
+  [tcp.serversTransports.default.tls]
+    rootCAs = ["` + fileTLS.Name() + `"]
+  	[[tcp.serversTransports.default.tls.certificates]]
+      certFile = "` + fileTLS.Name() + `"
+      keyFile = "` + fileTLSKey.Name() + `"
 `
 
-	_, err = fileConfig.Write([]byte(content))
+	_, err = fileConfig.WriteString(content)
 	require.NoError(t, err)
 
 	provider := &Provider{}
-	configuration, err := provider.loadFileConfig(context.Background(), fileConfig.Name(), true)
+	configuration, err := provider.loadFileConfig(t.Context(), fileConfig.Name(), true)
 	require.NoError(t, err)
 
 	require.Equal(t, "CONTENT", configuration.TLS.Certificates[0].Certificate.CertFile.String())
@@ -74,6 +80,10 @@ func TestTLSCertificateContent(t *testing.T) {
 	require.Equal(t, "CONTENT", configuration.HTTP.ServersTransports["default"].Certificates[0].CertFile.String())
 	require.Equal(t, "CONTENTKEY", configuration.HTTP.ServersTransports["default"].Certificates[0].KeyFile.String())
 	require.Equal(t, "CONTENT", configuration.HTTP.ServersTransports["default"].RootCAs[0].String())
+
+	require.Equal(t, "CONTENT", configuration.TCP.ServersTransports["default"].TLS.Certificates[0].CertFile.String())
+	require.Equal(t, "CONTENTKEY", configuration.TCP.ServersTransports["default"].TLS.Certificates[0].KeyFile.String())
+	require.Equal(t, "CONTENT", configuration.TCP.ServersTransports["default"].TLS.RootCAs[0].String())
 }
 
 func TestErrorWhenEmptyConfig(t *testing.T) {
@@ -81,7 +91,7 @@ func TestErrorWhenEmptyConfig(t *testing.T) {
 	configChan := make(chan dynamic.Message)
 	errorChan := make(chan struct{})
 	go func() {
-		err := provider.Provide(configChan, safe.NewPool(context.Background()))
+		err := provider.Provide(configChan, safe.NewPool(t.Context()))
 		assert.Error(t, err)
 		close(errorChan)
 	}()
@@ -96,6 +106,32 @@ func TestErrorWhenEmptyConfig(t *testing.T) {
 	}
 }
 
+func TestBuildConfigurationErrorIncludesFilename(t *testing.T) {
+	tempDir := t.TempDir()
+
+	file, err := os.CreateTemp(tempDir, "temp*.yml")
+	require.NoError(t, err)
+
+	// passHostHeader is intentionally misindented to produce a YAML syntax error.
+	content := `
+http:
+  services:
+    Service01:
+      loadBalancer:
+        servers:
+          - url: "http://localhost:8000"
+       passHostHeader: true
+`
+	_, err = file.WriteString(content)
+	require.NoError(t, err)
+
+	provider := &Provider{Filename: file.Name()}
+
+	_, err = provider.buildConfiguration()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, file.Name())
+}
+
 func TestProvideWithoutWatch(t *testing.T) {
 	for _, test := range getTestCases() {
 		t.Run(test.desc+" without watch", func(t *testing.T) {
@@ -105,7 +141,7 @@ func TestProvideWithoutWatch(t *testing.T) {
 			provider.DebugLogGeneratedTemplate = true
 
 			go func() {
-				err := provider.Provide(configChan, safe.NewPool(context.Background()))
+				err := provider.Provide(configChan, safe.NewPool(t.Context()))
 				assert.NoError(t, err)
 			}()
 
@@ -135,7 +171,7 @@ func TestProvideWithWatch(t *testing.T) {
 			configChan := make(chan dynamic.Message)
 
 			go func() {
-				err := provider.Provide(configChan, safe.NewPool(context.Background()))
+				err := provider.Provide(configChan, safe.NewPool(t.Context()))
 				assert.NoError(t, err)
 			}()
 
@@ -145,10 +181,10 @@ func TestProvideWithWatch(t *testing.T) {
 				require.NotNil(t, conf.Configuration.HTTP)
 				numServices := len(conf.Configuration.HTTP.Services) + len(conf.Configuration.TCP.Services) + len(conf.Configuration.UDP.Services)
 				numRouters := len(conf.Configuration.HTTP.Routers) + len(conf.Configuration.TCP.Routers) + len(conf.Configuration.UDP.Routers)
-				assert.Equal(t, numServices, 0)
-				assert.Equal(t, numRouters, 0)
+				assert.Equal(t, 0, numServices)
+				assert.Equal(t, 0, numRouters)
 				require.NotNil(t, conf.Configuration.TLS)
-				assert.Len(t, conf.Configuration.TLS.Certificates, 0)
+				assert.Empty(t, conf.Configuration.TLS.Certificates)
 			case <-timeout:
 				t.Errorf("timeout while waiting for config")
 			}
@@ -184,6 +220,38 @@ func TestProvideWithWatch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProvideWatchWithNonConfigDanglingSymlink(t *testing.T) {
+	tempDir := t.TempDir()
+
+	err := copyFile("./fixtures/yaml/simple_file_01.yml", filepath.Join(tempDir, "simple_file_01.yml"))
+	require.NoError(t, err)
+
+	err = os.Symlink(filepath.Join(tempDir, "non_existent_file.txt"), filepath.Join(tempDir, "dangling_symlink.txt"))
+	require.NoError(t, err)
+
+	provider := &Provider{
+		Directory: tempDir,
+		Watch:     true,
+	}
+	configChan := make(chan dynamic.Message)
+	go func() {
+		err := provider.Provide(configChan, safe.NewPool(t.Context()))
+		assert.NoError(t, err)
+	}()
+
+	timeout := time.After(time.Second)
+	select {
+	case conf := <-configChan:
+		require.NotNil(t, conf.Configuration.HTTP)
+		numServices := len(conf.Configuration.HTTP.Services) + len(conf.Configuration.TCP.Services) + len(conf.Configuration.UDP.Services)
+		numRouters := len(conf.Configuration.HTTP.Routers) + len(conf.Configuration.TCP.Routers) + len(conf.Configuration.UDP.Routers)
+		assert.Equal(t, 6, numServices)
+		assert.Equal(t, 3, numRouters)
+	case <-timeout:
+		t.Errorf("timeout while waiting for config")
 	}
 }
 

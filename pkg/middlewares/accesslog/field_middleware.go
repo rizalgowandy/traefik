@@ -2,9 +2,13 @@ package accesslog
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/vulcand/oxy/utils"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/middlewares/capture"
+	"github.com/traefik/traefik/v3/pkg/observability/logs"
+	"github.com/vulcand/oxy/v2/utils"
 )
 
 // FieldApply function hook to add data in accesslog.
@@ -41,24 +45,69 @@ func (f *FieldHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // AddServiceFields add service fields.
 func AddServiceFields(rw http.ResponseWriter, req *http.Request, next http.Handler, data *LogData) {
-	data.Core[ServiceURL] = req.URL // note that this is *not* the original incoming URL
-	data.Core[ServiceAddr] = req.URL.Host
+	start := time.Now().UTC()
+
+	next.ServeHTTP(rw, req)
+
+	// use UTC to handle switchover of daylight saving correctly
+	data.Core[OriginDuration] = time.Now().UTC().Sub(start)
+	// make copy of headers, so we can ensure there is no subsequent mutation
+	// during response processing
+	data.OriginResponse = make(http.Header)
+	utils.CopyHeaders(data.OriginResponse, rw.Header())
+
+	ctx := req.Context()
+	capt, err := capture.FromContext(ctx)
+	if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str(logs.MiddlewareType, "AccessLogs").Msg("Could not get Capture")
+		return
+	}
+
+	data.Core[OriginStatus] = capt.StatusCode()
+	data.Core[OriginContentSize] = capt.ResponseSize()
+}
+
+// InitServiceFields init service fields.
+func InitServiceFields(rw http.ResponseWriter, req *http.Request, next http.Handler, data *LogData) {
+	// Because they are expected to be initialized when the logger is processing the data table,
+	// the origin fields are initialized in case the response is returned by Traefik itself, and not a service.
+	data.Core[OriginDuration] = time.Duration(0)
+	data.Core[OriginStatus] = 0
+	data.Core[OriginContentSize] = int64(0)
 
 	next.ServeHTTP(rw, req)
 }
 
-// AddOriginFields add origin fields.
-func AddOriginFields(rw http.ResponseWriter, req *http.Request, next http.Handler, data *LogData) {
-	crw := newCaptureResponseWriter(rw)
-	start := time.Now().UTC()
+const separator = " -> "
 
-	next.ServeHTTP(crw, req)
+// ConcatFieldHandler concatenates field values instead of overriding them.
+type ConcatFieldHandler struct {
+	next  http.Handler
+	name  string
+	value string
+}
 
-	// use UTC to handle switchover of daylight saving correctly
-	data.Core[OriginDuration] = time.Now().UTC().Sub(start)
-	data.Core[OriginStatus] = crw.Status()
-	// make copy of headers so we can ensure there is no subsequent mutation during response processing
-	data.OriginResponse = make(http.Header)
-	utils.CopyHeaders(data.OriginResponse, crw.Header())
-	data.Core[OriginContentSize] = crw.Size()
+// NewConcatFieldHandler creates a ConcatField handler that concatenates values.
+func NewConcatFieldHandler(next http.Handler, name, value string) http.Handler {
+	return &ConcatFieldHandler{next: next, name: name, value: value}
+}
+
+func (c *ConcatFieldHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	table := GetLogData(req)
+	if table == nil {
+		c.next.ServeHTTP(rw, req)
+		return
+	}
+
+	// Check if field already exists and concatenate if so
+	if existingValue, exists := table.Core[c.name]; exists && existingValue != nil {
+		if existingStr, ok := existingValue.(string); ok && strings.TrimSpace(existingStr) != "" {
+			table.Core[c.name] = existingStr + separator + c.value
+			c.next.ServeHTTP(rw, req)
+			return
+		}
+	}
+
+	table.Core[c.name] = c.value
+	c.next.ServeHTTP(rw, req)
 }

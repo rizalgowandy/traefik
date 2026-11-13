@@ -2,59 +2,26 @@ package tcp
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
 	"io"
 	"net"
 	"testing"
 	"time"
 
-	"github.com/pires/go-proxyproto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
 )
-
-func fakeRedis(t *testing.T, listener net.Listener) {
-	t.Helper()
-
-	for {
-		conn, err := listener.Accept()
-		fmt.Println("Accept on server")
-		require.NoError(t, err)
-
-		for {
-			withErr := false
-			buf := make([]byte, 64)
-			if _, err := conn.Read(buf); err != nil {
-				withErr = true
-			}
-
-			if string(buf[:4]) == "ping" {
-				time.Sleep(1 * time.Millisecond)
-				if _, err := conn.Write([]byte("PONG")); err != nil {
-					_ = conn.Close()
-					return
-				}
-			}
-
-			if withErr {
-				_ = conn.Close()
-				return
-			}
-		}
-	}
-}
 
 func TestCloseWrite(t *testing.T) {
 	backendListener, err := net.Listen("tcp", ":0")
 	require.NoError(t, err)
 
-	go fakeRedis(t, backendListener)
+	go fakeServer(t, backendListener)
 	_, port, err := net.SplitHostPort(backendListener.Addr().String())
 	require.NoError(t, err)
 
-	proxy, err := NewProxy(":"+port, 10*time.Millisecond, nil)
+	dialer := tcpDialer{&net.Dialer{}, 10 * time.Millisecond, nil}
+
+	proxy, err := NewProxy(":"+port, dialer)
 	require.NoError(t, err)
 
 	proxyListener, err := net.Listen("tcp", ":0")
@@ -84,129 +51,110 @@ func TestCloseWrite(t *testing.T) {
 	buffer := bytes.NewBuffer(buf)
 	n, err := io.Copy(buffer, conn)
 	require.NoError(t, err)
+
 	require.Equal(t, int64(4), n)
 	require.Equal(t, "PONG", buffer.String())
 }
 
-func TestProxyProtocol(t *testing.T) {
+func TestIsReadConnResetError(t *testing.T) {
 	testCases := []struct {
-		desc    string
-		version int
+		desc        string
+		resetClient bool
 	}{
 		{
-			desc:    "PROXY protocol v1",
-			version: 1,
+			desc:        "client resets the connection",
+			resetClient: true,
 		},
 		{
-			desc:    "PROXY protocol v2",
-			version: 2,
+			desc:        "backend resets the connection",
+			resetClient: false,
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
-
-		t.Run(test.desc, func(t *testing.T) {
-			backendListener, err := net.Listen("tcp", ":0")
-			require.NoError(t, err)
-
-			var version int
-			proxyBackendListener := proxyproto.Listener{
-				Listener: backendListener,
-				ValidateHeader: func(h *proxyproto.Header) error {
-					version = int(h.Version)
-					return nil
-				},
-				Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
-					switch test.version {
-					case 1, 2:
-						return proxyproto.USE, nil
-					default:
-						return proxyproto.REQUIRE, errors.New("unsupported version")
-					}
-				},
-			}
-			defer proxyBackendListener.Close()
-
-			go fakeRedis(t, &proxyBackendListener)
-
-			_, port, err := net.SplitHostPort(proxyBackendListener.Addr().String())
-			require.NoError(t, err)
-
-			proxy, err := NewProxy(":"+port, 10*time.Millisecond, &dynamic.ProxyProtocol{Version: test.version})
-			require.NoError(t, err)
-
-			proxyListener, err := net.Listen("tcp", ":0")
-			require.NoError(t, err)
-
-			go func() {
-				for {
-					conn, err := proxyListener.Accept()
-					require.NoError(t, err)
-					proxy.ServeTCP(conn.(*net.TCPConn))
-				}
-			}()
-
-			_, port, err = net.SplitHostPort(proxyListener.Addr().String())
-			require.NoError(t, err)
-
-			conn, err := net.Dial("tcp", ":"+port)
-			require.NoError(t, err)
-
-			_, err = conn.Write([]byte("ping\n"))
-			require.NoError(t, err)
-
-			err = conn.(*net.TCPConn).CloseWrite()
-			require.NoError(t, err)
-
-			var buf []byte
-			buffer := bytes.NewBuffer(buf)
-			n, err := io.Copy(buffer, conn)
-			require.NoError(t, err)
-
-			assert.Equal(t, int64(4), n)
-			assert.Equal(t, "PONG", buffer.String())
-
-			assert.Equal(t, test.version, version)
-		})
-	}
-}
-
-func TestLookupAddress(t *testing.T) {
-	testCases := []struct {
-		desc          string
-		address       string
-		expectRefresh bool
-	}{
-		{
-			desc:    "IP doesn't need refresh",
-			address: "8.8.4.4:53",
-		},
-		{
-			desc:          "Hostname needs refresh",
-			address:       "dns.google:53",
-			expectRefresh: true,
-		},
-	}
-
-	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			proxy, err := NewProxy(test.address, 10*time.Millisecond, nil)
-			require.NoError(t, err)
+			client, clientConn := tcpConnPair(t)
+			backendConn, backend := tcpConnPair(t)
 
-			require.NotNil(t, proxy.target)
+			// Hides (*net.TCPConn).WriteTo, as the client connection is wrapped when handled by the TCP proxy.
+			wrappedClientConn := struct{ WriteCloser }{clientConn}
 
-			conn, err := proxy.dialBackend()
-			require.NoError(t, err)
+			errCh := make(chan error, 2)
+			go func() {
+				_, err := io.Copy(backendConn, wrappedClientConn)
+				errCh <- err
+			}()
+			go func() {
+				_, err := io.Copy(wrappedClientConn, backendConn)
+				errCh <- err
+			}()
 
-			if test.expectRefresh {
-				assert.NotEqual(t, test.address, conn.RemoteAddr().String())
-			} else {
-				assert.Equal(t, test.address, conn.RemoteAddr().String())
+			resetConn := backend
+			if test.resetClient {
+				resetConn = client
 			}
+
+			// Closing the connection with a zero linger timeout sends an RST packet.
+			require.NoError(t, resetConn.SetLinger(0))
+			require.NoError(t, resetConn.Close())
+
+			err := <-errCh
+			require.Error(t, err)
+			assert.True(t, isReadConnResetError(err), err)
 		})
+	}
+
+	assert.False(t, isReadConnResetError(nil))
+	assert.False(t, isReadConnResetError(io.EOF))
+}
+
+// tcpConnPair returns both ends of a TCP connection.
+func tcpConnPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	dialed, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dialed.Close() })
+
+	accepted, err := listener.Accept()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = accepted.Close() })
+
+	return dialed.(*net.TCPConn), accepted.(*net.TCPConn)
+}
+
+func fakeServer(t *testing.T, listener net.Listener) {
+	t.Helper()
+
+	for {
+		conn, err := listener.Accept()
+		require.NoError(t, err)
+
+		for {
+			withErr := false
+			buf := make([]byte, 64)
+			if _, err := conn.Read(buf); err != nil {
+				withErr = true
+			}
+
+			if string(buf[:4]) == "ping" {
+				time.Sleep(1 * time.Millisecond)
+				if _, err := conn.Write([]byte("PONG")); err != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+
+			if withErr {
+				_ = conn.Close()
+				return
+			}
+		}
 	}
 }

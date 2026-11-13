@@ -1,15 +1,16 @@
 package headers
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares"
+	"github.com/vulcand/oxy/v2/forward"
 )
 
 // Header is a middleware that helps setup a few basic security features.
@@ -27,9 +28,6 @@ type Header struct {
 func NewHeader(next http.Handler, cfg dynamic.Headers) (*Header, error) {
 	hasCustomHeaders := cfg.HasCustomHeadersDefined()
 	hasCorsHeaders := cfg.HasCorsHeadersDefined()
-
-	ctx := log.With(context.Background(), log.Str(log.MiddlewareType, typeName))
-	handleDeprecation(ctx, &cfg)
 
 	regexes := make([]*regexp.Regexp, len(cfg.AccessControlAllowOriginListRegex))
 	for i, str := range cfg.AccessControlAllowOriginListRegex {
@@ -52,6 +50,8 @@ func NewHeader(next http.Handler, cfg dynamic.Headers) (*Header, error) {
 func (s *Header) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Handle Cors headers and preflight if configured.
 	if isPreflight := s.processCorsHeaders(rw, req); isPreflight {
+		rw.Header().Set("Content-Length", "0")
+		rw.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -61,24 +61,7 @@ func (s *Header) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// If there is a next, call it.
 	if s.next != nil {
-		s.next.ServeHTTP(newResponseModifier(rw, req, s.PostRequestModifyResponseHeaders), req)
-	}
-}
-
-// modifyCustomRequestHeaders sets or deletes custom request headers.
-func (s *Header) modifyCustomRequestHeaders(req *http.Request) {
-	// Loop through Custom request headers
-	for header, value := range s.headers.CustomRequestHeaders {
-		switch {
-		case value == "":
-			req.Header.Del(header)
-
-		case strings.EqualFold(header, "Host"):
-			req.Host = value
-
-		default:
-			req.Header.Set(header, value)
-		}
+		s.next.ServeHTTP(middlewares.NewResponseModifier(rw, req, s.PostRequestModifyResponseHeaders), req)
 	}
 }
 
@@ -96,10 +79,8 @@ func (s *Header) PostRequestModifyResponseHeaders(res *http.Response) error {
 	}
 
 	if res != nil && res.Request != nil {
-		originHeader := res.Request.Header.Get("Origin")
-		allowed, match := s.isOriginAllowed(originHeader)
-
-		if allowed {
+		match, ok := s.matchOrigin(res.Request.Header.Get("Origin"))
+		if ok {
 			res.Header.Set("Access-Control-Allow-Origin", match)
 		}
 	}
@@ -110,7 +91,9 @@ func (s *Header) PostRequestModifyResponseHeaders(res *http.Response) error {
 
 	if len(s.headers.AccessControlExposeHeaders) > 0 {
 		exposeHeaders := strings.Join(s.headers.AccessControlExposeHeaders, ",")
-		res.Header.Set("Access-Control-Expose-Headers", exposeHeaders)
+		if !(slices.Contains(s.headers.AccessControlExposeHeaders, "*") && s.headers.AccessControlAllowCredentials) {
+			res.Header.Set("Access-Control-Expose-Headers", exposeHeaders)
+		}
 	}
 
 	if !s.headers.AddVaryHeader {
@@ -129,6 +112,29 @@ func (s *Header) PostRequestModifyResponseHeaders(res *http.Response) error {
 
 	res.Header.Set("Vary", varyHeader)
 	return nil
+}
+
+// modifyCustomRequestHeaders sets or deletes custom request headers.
+func (s *Header) modifyCustomRequestHeaders(req *http.Request) {
+	// Note: the header names aliasing the custom request headers (e.g. X_Auth_User) are not handled here,
+	// as the aliasHeadersStrategy entry point option is expected to be enabled to prevent header spoofing.
+	// Loop through Custom request headers
+	for header, value := range s.headers.CustomRequestHeaders {
+		switch {
+		// Handling https://github.com/golang/go/commit/ecdbffd4ec68b509998792f120868fec319de59b.
+		case value == "" && header == forward.XForwardedFor:
+			req.Header[header] = nil
+
+		case value == "":
+			req.Header.Del(header)
+
+		case strings.EqualFold(header, "Host"):
+			req.Host = value
+
+		default:
+			req.Header.Set(header, value)
+		}
+	}
 }
 
 // processCorsHeaders processes the incoming request,
@@ -151,39 +157,61 @@ func (s *Header) processCorsHeaders(rw http.ResponseWriter, req *http.Request) b
 		}
 
 		allowHeaders := strings.Join(s.headers.AccessControlAllowHeaders, ",")
-		if allowHeaders != "" {
+		if slices.Contains(s.headers.AccessControlAllowHeaders, "*") && s.headers.AccessControlAllowCredentials {
+			if acrh := req.Header.Get("Access-Control-Request-Headers"); acrh != "" {
+				rw.Header().Set("Access-Control-Allow-Headers", acrh)
+			}
+		} else if allowHeaders != "" {
 			rw.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 		}
 
 		allowMethods := strings.Join(s.headers.AccessControlAllowMethods, ",")
-		if allowMethods != "" {
+		if slices.Contains(s.headers.AccessControlAllowMethods, "*") && s.headers.AccessControlAllowCredentials {
+			rw.Header().Set("Access-Control-Allow-Methods", reqAcMethod)
+		} else if allowMethods != "" {
 			rw.Header().Set("Access-Control-Allow-Methods", allowMethods)
 		}
 
-		allowed, match := s.isOriginAllowed(originHeader)
-		if allowed {
+		match, ok := s.matchOrigin(originHeader)
+		if ok {
 			rw.Header().Set("Access-Control-Allow-Origin", match)
 		}
 
-		rw.Header().Set("Access-Control-Max-Age", strconv.Itoa(int(s.headers.AccessControlMaxAge)))
+		if s.headers.AccessControlMaxAge != nil {
+			rw.Header().Set("Access-Control-Max-Age", strconv.FormatInt(*s.headers.AccessControlMaxAge, 10))
+		}
+
+		if len(s.headers.AccessControlExposeHeaders) > 0 {
+			exposeHeaders := strings.Join(s.headers.AccessControlExposeHeaders, ",")
+			if !(slices.Contains(s.headers.AccessControlExposeHeaders, "*") && s.headers.AccessControlAllowCredentials) {
+				rw.Header().Set("Access-Control-Expose-Headers", exposeHeaders)
+			}
+		}
+
 		return true
 	}
 
 	return false
 }
 
-func (s *Header) isOriginAllowed(origin string) (bool, string) {
+func (s *Header) matchOrigin(origin string) (string, bool) {
 	for _, item := range s.headers.AccessControlAllowOriginList {
-		if item == "*" || item == origin {
-			return true, item
+		switch item {
+		case origin:
+			return item, true
+		case "*":
+			if s.headers.AccessControlAllowCredentials {
+				return origin, true // Can't use wildcard with credentials.
+			}
+			return item, true
 		}
 	}
 
 	for _, regex := range s.allowOriginRegexes {
 		if regex.MatchString(origin) {
-			return true, origin
+			return origin, true
 		}
 	}
 
-	return false, ""
+	return "", false
 }

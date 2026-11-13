@@ -7,10 +7,11 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/provider/kubernetes/crd/traefik/v1alpha1"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	traefikv1alpha1 "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 )
 
 func (p *Provider) loadIngressRouteUDPConfiguration(ctx context.Context, client Client) *dynamic.UDPConfiguration {
@@ -20,9 +21,13 @@ func (p *Provider) loadIngressRouteUDPConfiguration(ctx context.Context, client 
 	}
 
 	for _, ingressRouteUDP := range client.GetIngressRouteUDPs() {
-		logger := log.FromContext(log.With(ctx, log.Str("ingress", ingressRouteUDP.Name), log.Str("namespace", ingressRouteUDP.Namespace)))
+		logger := log.Ctx(ctx).With().Str("ingress", ingressRouteUDP.Name).Str("namespace", ingressRouteUDP.Namespace).Logger()
 
-		if !shouldProcessIngress(p.IngressClass, ingressRouteUDP.Annotations[annotationKubernetesIngressClass]) {
+		ingressClassName, usingDeprecatedAnnotation := getIngressClassName(ingressRouteUDP.Spec.IngressClassName, ingressRouteUDP.Annotations)
+		if usingDeprecatedAnnotation {
+			logger.Warn().Msgf("'%s' is a deprecated annotation, please use spec.ingressClassName instead.", annotationKubernetesIngressClass)
+		}
+		if !shouldProcessIngress(p.IngressClass, ingressClassName) {
 			continue
 		}
 
@@ -32,28 +37,47 @@ func (p *Provider) loadIngressRouteUDPConfiguration(ctx context.Context, client 
 		}
 
 		for i, route := range ingressRouteUDP.Spec.Routes {
-			key := fmt.Sprintf("%s-%d", ingressName, i)
-			serviceName := makeID(ingressRouteUDP.Namespace, key)
+			routeIndex := strconv.Itoa(i)
 
-			for _, service := range route.Services {
+			routerName := p.nameBuilder.udpRouter(ingressRouteUDP.Namespace, ingressName, i)
+
+			serviceName := routerName
+
+			var wrrName string
+			if p.nameBuilder.safe && len(route.Services) > 1 {
+				wrrName = makeSafeKey(ingressRouteUDP.Namespace, ingressName, routeIndex, roleWRR)
+			}
+
+			for si, service := range route.Services {
 				balancerServerUDP, err := p.createLoadBalancerServerUDP(client, ingressRouteUDP.Namespace, service)
 				if err != nil {
-					logger.
-						WithField("serviceName", service.Name).
-						WithField("servicePort", service.Port).
-						Errorf("Cannot create service: %v", err)
+					logger.Error().
+						Str("serviceName", service.Name).
+						Stringer("servicePort", &service.Port).
+						Err(err).
+						Msg("Cannot create service")
 					continue
 				}
 
 				// If there is only one service defined, we skip the creation of the load balancer of services,
 				// i.e. the service on top is directly a load balancer of servers.
 				if len(route.Services) == 1 {
-					conf.Services[serviceName] = balancerServerUDP
+					if p.nameBuilder.safe {
+						serviceName = makeSafeKey(ingressRouteUDP.Namespace, ingressName, routeIndex, roleLB)
+					}
+					addToConfig(&logger, "service", serviceName, conf.Services, balancerServerUDP)
 					break
 				}
 
-				serviceKey := fmt.Sprintf("%s-%s-%s", serviceName, service.Name, &service.Port)
-				conf.Services[serviceKey] = balancerServerUDP
+				var serviceKey string
+				if p.nameBuilder.safe {
+					serviceName = wrrName
+					serviceKey = makeSafeKey(ingressRouteUDP.Namespace, ingressName, routeIndex, roleWRR, strconv.Itoa(si), namespaceOrParentNamespace(service.Namespace, ingressRouteUDP.Namespace), service.Name, service.Port.String())
+				} else {
+					serviceKey = fmt.Sprintf("%s-%s-%s", serviceName, service.Name, service.Port.String())
+				}
+
+				addToConfig(&logger, "service", serviceKey, conf.Services, balancerServerUDP)
 
 				srv := dynamic.UDPWRRService{Name: serviceKey}
 				srv.SetDefaults()
@@ -67,17 +91,17 @@ func (p *Provider) loadIngressRouteUDPConfiguration(ctx context.Context, client 
 				conf.Services[serviceName].Weighted.Services = append(conf.Services[serviceName].Weighted.Services, srv)
 			}
 
-			conf.Routers[serviceName] = &dynamic.UDPRouter{
+			addToConfig(&logger, "router", routerName, conf.Routers, &dynamic.UDPRouter{
 				EntryPoints: ingressRouteUDP.Spec.EntryPoints,
 				Service:     serviceName,
-			}
+			})
 		}
 	}
 
 	return conf
 }
 
-func (p *Provider) createLoadBalancerServerUDP(client Client, parentNamespace string, service v1alpha1.ServiceUDP) (*dynamic.UDPService, error) {
+func (p *Provider) createLoadBalancerServerUDP(client Client, parentNamespace string, service traefikv1alpha1.ServiceUDP) (*dynamic.UDPService, error) {
 	ns := parentNamespace
 	if len(service.Namespace) > 0 {
 		if !isNamespaceAllowed(p.AllowCrossNamespace, parentNamespace, service.Namespace) {
@@ -101,7 +125,7 @@ func (p *Provider) createLoadBalancerServerUDP(client Client, parentNamespace st
 	return udpService, nil
 }
 
-func (p *Provider) loadUDPServers(client Client, namespace string, svc v1alpha1.ServiceUDP) ([]dynamic.UDPServer, error) {
+func (p *Provider) loadUDPServers(client Client, namespace string, svc traefikv1alpha1.ServiceUDP) ([]dynamic.UDPServer, error) {
 	service, exists, err := client.GetService(namespace, svc.Name)
 	if err != nil {
 		return nil, err
@@ -121,43 +145,94 @@ func (p *Provider) loadUDPServers(client Client, namespace string, svc v1alpha1.
 	}
 
 	var servers []dynamic.UDPServer
+	if service.Spec.Type == corev1.ServiceTypeNodePort && svc.NodePortLB {
+		if p.DisableClusterScopeResources {
+			return nil, errors.New("nodes lookup is disabled")
+		}
+
+		nodes, nodesExists, nodesErr := client.GetNodes()
+		if nodesErr != nil {
+			return nil, nodesErr
+		}
+
+		if !nodesExists || len(nodes) == 0 {
+			return nil, fmt.Errorf("nodes not found for NodePort service %s/%s", svc.Namespace, svc.Name)
+		}
+
+		for _, node := range nodes {
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == corev1.NodeInternalIP {
+					servers = append(servers, dynamic.UDPServer{
+						Address: net.JoinHostPort(addr.Address, strconv.Itoa(int(svcPort.NodePort))),
+					})
+				}
+			}
+		}
+
+		if len(servers) == 0 {
+			return nil, fmt.Errorf("no servers were generated for service %s/%s", svc.Namespace, svc.Name)
+		}
+
+		return servers, nil
+	}
+
 	if service.Spec.Type == corev1.ServiceTypeExternalName {
 		servers = append(servers, dynamic.UDPServer{
 			Address: net.JoinHostPort(service.Spec.ExternalName, strconv.Itoa(int(svcPort.Port))),
 		})
 	} else {
-		endpoints, endpointsExists, endpointsErr := client.GetEndpoints(namespace, svc.Name)
-		if endpointsErr != nil {
-			return nil, endpointsErr
+		nativeLB := p.NativeLBByDefault
+		if svc.NativeLB != nil {
+			nativeLB = *svc.NativeLB
+		}
+		if nativeLB {
+			address, err := getNativeServiceAddress(*service, *svcPort)
+			if err != nil {
+				return nil, fmt.Errorf("getting native Kubernetes Service address: %w", err)
+			}
+
+			return []dynamic.UDPServer{{Address: address}}, nil
 		}
 
-		if !endpointsExists {
-			return nil, errors.New("endpoints not found")
+		endpointSlices, err := client.GetEndpointSlicesForService(namespace, svc.Name)
+		if err != nil {
+			return nil, fmt.Errorf("getting endpointslices: %w", err)
 		}
 
-		if len(endpoints.Subsets) == 0 {
-			return nil, errors.New("subset not found")
-		}
-
-		var port int32
-		for _, subset := range endpoints.Subsets {
-			for _, p := range subset.Ports {
-				if svcPort.Name == p.Name {
-					port = p.Port
+		addresses := map[string]struct{}{}
+		for _, endpointSlice := range endpointSlices {
+			var port int32
+			for _, p := range endpointSlice.Ports {
+				if p.Name != nil && svcPort.Name == *p.Name {
+					port = ptr.Deref(p.Port, 0)
 					break
 				}
 			}
-
 			if port == 0 {
-				return nil, errors.New("cannot define a port")
+				continue
 			}
 
-			for _, addr := range subset.Addresses {
-				servers = append(servers, dynamic.UDPServer{
-					Address: net.JoinHostPort(addr.IP, strconv.Itoa(int(port))),
-				})
+			for _, endpoint := range endpointSlice.Endpoints {
+				if endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready {
+					continue
+				}
+
+				for _, address := range endpoint.Addresses {
+					if _, ok := addresses[address]; ok {
+						continue
+					}
+
+					addresses[address] = struct{}{}
+					servers = append(servers, dynamic.UDPServer{
+						Address: net.JoinHostPort(address, strconv.Itoa(int(port))),
+					})
+				}
 			}
 		}
+	}
+
+	if len(servers) == 0 && !p.AllowEmptyServices {
+		return nil, fmt.Errorf("no servers found for %s/%s", namespace, svc.Name)
 	}
 
 	return servers, nil

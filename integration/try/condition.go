@@ -1,6 +1,8 @@
 package try
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,7 +10,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/abronan/valkeyrie/store"
+	"github.com/kvtools/valkeyrie/store"
 )
 
 // ResponseCondition is a retry condition function.
@@ -23,6 +25,8 @@ func BodyContains(values ...string) ResponseCondition {
 		if err != nil {
 			return fmt.Errorf("failed to read response body: %w", err)
 		}
+
+		res.Body = io.NopCloser(bytes.NewBuffer(body))
 
 		for _, value := range values {
 			if !strings.Contains(string(body), value) {
@@ -42,6 +46,8 @@ func BodyNotContains(values ...string) ResponseCondition {
 			return fmt.Errorf("failed to read response body: %w", err)
 		}
 
+		res.Body = io.NopCloser(bytes.NewBuffer(body))
+
 		for _, value := range values {
 			if strings.Contains(string(body), value) {
 				return fmt.Errorf("find '%s' in body '%s'", value, string(body))
@@ -60,6 +66,8 @@ func BodyContainsOr(values ...string) ResponseCondition {
 			return fmt.Errorf("failed to read response body: %w", err)
 		}
 
+		res.Body = io.NopCloser(bytes.NewBuffer(body))
+
 		for _, value := range values {
 			if strings.Contains(string(body), value) {
 				return nil
@@ -77,6 +85,8 @@ func HasBody() ResponseCondition {
 		if err != nil {
 			return fmt.Errorf("failed to read response body: %w", err)
 		}
+
+		res.Body = io.NopCloser(bytes.NewBuffer(body))
 
 		if len(body) == 0 {
 			return errors.New("response doesn't have body content")
@@ -185,7 +195,7 @@ type DoCondition func() error
 // Verify if a Key exists in the store.
 func KVExists(kv store.Store, key string) DoCondition {
 	return func() error {
-		_, err := kv.Exists(key, nil)
+		_, err := kv.Exists(context.Background(), key, nil)
 		return err
 	}
 }

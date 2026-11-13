@@ -8,17 +8,13 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/middlewares"
-	"github.com/traefik/traefik/v2/pkg/middlewares/replacepath"
-	"github.com/traefik/traefik/v2/pkg/tracing"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares"
+	"github.com/traefik/traefik/v3/pkg/middlewares/observability"
+	"github.com/traefik/traefik/v3/pkg/middlewares/replacepath"
 )
 
-const (
-	typeName = "ReplacePathRegex"
-)
+const typeName = "ReplacePathRegex"
 
 // ReplacePathRegex is a middleware used to replace the path of a URL request with a regular expression.
 type replacePathRegex struct {
@@ -30,7 +26,7 @@ type replacePathRegex struct {
 
 // New creates a new replace path regex middleware.
 func New(ctx context.Context, next http.Handler, config dynamic.ReplacePathRegex, name string) (http.Handler, error) {
-	log.FromContext(middlewares.GetLoggerCtx(ctx, name, typeName)).Debug("Creating middleware")
+	middlewares.GetLogger(ctx, name, typeName).Debug().Msg("Creating middleware")
 
 	exp, err := regexp.Compile(strings.TrimSpace(config.Regex))
 	if err != nil {
@@ -45,21 +41,22 @@ func New(ctx context.Context, next http.Handler, config dynamic.ReplacePathRegex
 	}, nil
 }
 
-func (rp *replacePathRegex) GetTracingInformation() (string, ext.SpanKindEnum) {
-	return rp.name, tracing.SpanKindNoneEnum
+func (rp *replacePathRegex) GetTracingInformation() (string, string) {
+	return rp.name, typeName
 }
 
 func (rp *replacePathRegex) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	var currentPath string
-	if req.URL.RawPath == "" {
-		currentPath = req.URL.Path
-	} else {
-		currentPath = req.URL.RawPath
+	logger := middlewares.GetLogger(req.Context(), rp.name, typeName)
+
+	currentPath := req.URL.RawPath
+	if currentPath == "" {
+		currentPath = req.URL.EscapedPath()
 	}
 
-	if rp.regexp != nil && len(rp.replacement) > 0 && rp.regexp.MatchString(currentPath) {
+	if rp.regexp != nil && rp.regexp.MatchString(currentPath) {
+		// Note: the header names aliasing the ReplacedPathHeader (e.g. X_Replaced_Path) are not handled here,
+		// as the aliasHeadersStrategy entry point option is expected to be enabled to prevent header spoofing.
 		req.Header.Add(replacepath.ReplacedPathHeader, currentPath)
-
 		req.URL.RawPath = rp.regexp.ReplaceAllString(currentPath, rp.replacement)
 
 		// as replacement can introduce escaped characters
@@ -68,12 +65,27 @@ func (rp *replacePathRegex) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 		var err error
 		req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
 		if err != nil {
-			log.FromContext(middlewares.GetLoggerCtx(context.Background(), rp.name, typeName)).Error(err)
+			middlewares.GetLogger(context.Background(), rp.name, typeName).Error().Msgf("Unable to unescape url raw path %q: %v", req.URL.RawPath, err)
+			observability.SetStatusErrorf(req.Context(), "Unable to unescape url raw path %q: %v", req.URL.RawPath, err)
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		req.RequestURI = req.URL.RequestURI()
+
+		// Here we are sanitizing the URL when the path is not empty,
+		// as the JoinPath method is adding a leading slash if the path is empty.
+		path := req.URL.Path
+		if path != "" {
+			req.URL = req.URL.JoinPath()
+		}
+
+		// Stop here if the normalization of the path produces a different path.
+		if path != req.URL.Path {
+			logger.Debug().Msgf("Rejecting request, sanitized path: %q is not equivalent to stripped path: %q", path, req.URL.Path)
+			http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
 	}
 
 	rp.next.ServeHTTP(rw, req)

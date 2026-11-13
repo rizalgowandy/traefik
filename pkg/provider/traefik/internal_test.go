@@ -1,7 +1,6 @@
 package traefik
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"os"
@@ -10,10 +9,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/static"
-	"github.com/traefik/traefik/v2/pkg/ping"
-	"github.com/traefik/traefik/v2/pkg/provider/rest"
-	"github.com/traefik/traefik/v2/pkg/types"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/static"
+	otypes "github.com/traefik/traefik/v3/pkg/observability/types"
+	"github.com/traefik/traefik/v3/pkg/ping"
+	acmeprovider "github.com/traefik/traefik/v3/pkg/provider/acme"
+	"github.com/traefik/traefik/v3/pkg/provider/rest"
+	"github.com/traefik/traefik/v3/pkg/types"
 )
 
 var updateExpected = flag.Bool("update_expected", false, "Update expected files in fixtures")
@@ -40,8 +42,8 @@ func Test_createConfiguration(t *testing.T) {
 						Insecure: true,
 					},
 				},
-				Metrics: &types.Metrics{
-					Prometheus: &types.Prometheus{
+				Metrics: &otypes.Metrics{
+					Prometheus: &otypes.Prometheus{
 						EntryPoint:    "test",
 						ManualRouting: false,
 					},
@@ -64,8 +66,8 @@ func Test_createConfiguration(t *testing.T) {
 						Insecure: false,
 					},
 				},
-				Metrics: &types.Metrics{
-					Prometheus: &types.Prometheus{
+				Metrics: &otypes.Metrics{
+					Prometheus: &otypes.Prometheus{
 						EntryPoint:    "test",
 						ManualRouting: true,
 					},
@@ -149,8 +151,8 @@ func Test_createConfiguration(t *testing.T) {
 		{
 			desc: "prometheus_simple.json",
 			staticCfg: static.Configuration{
-				Metrics: &types.Metrics{
-					Prometheus: &types.Prometheus{
+				Metrics: &otypes.Metrics{
+					Prometheus: &otypes.Prometheus{
 						EntryPoint:    "test",
 						ManualRouting: false,
 					},
@@ -160,8 +162,8 @@ func Test_createConfiguration(t *testing.T) {
 		{
 			desc: "prometheus_custom.json",
 			staticCfg: static.Configuration{
-				Metrics: &types.Metrics{
-					Prometheus: &types.Prometheus{
+				Metrics: &otypes.Metrics{
+					Prometheus: &otypes.Prometheus{
 						EntryPoint:    "test",
 						ManualRouting: true,
 					},
@@ -183,6 +185,11 @@ func Test_createConfiguration(t *testing.T) {
 									{Main: "mainB", SANs: []string{"sanB1", "sanB2"}},
 								},
 							},
+						},
+						Observability: &static.ObservabilityConfig{
+							AccessLogs: new(false),
+							Tracing:    new(false),
+							Metrics:    new(false),
 						},
 					},
 				},
@@ -254,16 +261,69 @@ func Test_createConfiguration(t *testing.T) {
 				},
 			},
 		},
+		{
+			desc: "redirection_with_acme_bypass.json",
+			staticCfg: static.Configuration{
+				EntryPoints: map[string]*static.EntryPoint{
+					"web": {
+						Address:         ":80",
+						AllowACMEByPass: true,
+						HTTP: static.HTTPConfig{
+							Redirections: &static.Redirections{
+								EntryPoint: &static.RedirectEntryPoint{
+									To:        "websecure",
+									Scheme:    "https",
+									Permanent: true,
+								},
+							},
+						},
+					},
+					"websecure": {
+						Address: ":443",
+					},
+				},
+			},
+		},
+		{
+			desc: "redirection_without_acme_bypass.json",
+			staticCfg: static.Configuration{
+				EntryPoints: map[string]*static.EntryPoint{
+					"web": {
+						Address: ":80",
+						HTTP: static.HTTPConfig{
+							Redirections: &static.Redirections{
+								EntryPoint: &static.RedirectEntryPoint{
+									To:        "websecure",
+									Scheme:    "https",
+									Permanent: true,
+								},
+							},
+						},
+					},
+					"websecure": {
+						Address: ":443",
+					},
+				},
+				CertificatesResolvers: map[string]static.CertificateResolver{
+					"default": {
+						ACME: &acmeprovider.Configuration{
+							HTTPChallenge: &acmeprovider.HTTPChallenge{
+								EntryPoint: "web",
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			provider := Provider{staticCfg: test.staticCfg}
 
-			cfg := provider.createConfiguration(context.Background())
+			cfg := provider.createConfiguration(t.Context())
 
 			filename := filepath.Join("fixtures", test.desc)
 
@@ -282,6 +342,98 @@ func Test_createConfiguration(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.JSONEq(t, string(expectedJSON), string(actualJSON))
+		})
+	}
+}
+
+func Test_createConfiguration_spiffe(t *testing.T) {
+	testCases := []struct {
+		desc         string
+		staticCfg    static.Configuration
+		expectedHTTP *dynamic.Spiffe
+		expectedTCP  *dynamic.Spiffe
+	}{
+		{
+			desc: "only the HTTP servers transport defines a SPIFFE configuration",
+			staticCfg: static.Configuration{
+				ServersTransport: &static.ServersTransport{
+					Spiffe: &static.Spiffe{
+						IDs:         []string{"spiffe://trust.domain/http"},
+						TrustDomain: "http.trust.domain",
+					},
+				},
+				TCPServersTransport: &static.TCPServersTransport{
+					TLS: &static.TLSClientConfig{},
+				},
+			},
+			expectedHTTP: &dynamic.Spiffe{
+				IDs:         []string{"spiffe://trust.domain/http"},
+				TrustDomain: "http.trust.domain",
+			},
+		},
+		{
+			desc: "only the TCP servers transport defines a SPIFFE configuration",
+			staticCfg: static.Configuration{
+				ServersTransport: &static.ServersTransport{},
+				TCPServersTransport: &static.TCPServersTransport{
+					TLS: &static.TLSClientConfig{
+						Spiffe: &static.Spiffe{
+							IDs:         []string{"spiffe://trust.domain/tcp"},
+							TrustDomain: "tcp.trust.domain",
+						},
+					},
+				},
+			},
+			expectedTCP: &dynamic.Spiffe{
+				IDs:         []string{"spiffe://trust.domain/tcp"},
+				TrustDomain: "tcp.trust.domain",
+			},
+		},
+		{
+			desc: "the HTTP and the TCP servers transports define distinct SPIFFE configurations",
+			staticCfg: static.Configuration{
+				ServersTransport: &static.ServersTransport{
+					Spiffe: &static.Spiffe{
+						IDs:         []string{"spiffe://trust.domain/http"},
+						TrustDomain: "http.trust.domain",
+					},
+				},
+				TCPServersTransport: &static.TCPServersTransport{
+					TLS: &static.TLSClientConfig{
+						Spiffe: &static.Spiffe{
+							IDs:         []string{"spiffe://trust.domain/tcp"},
+							TrustDomain: "tcp.trust.domain",
+						},
+					},
+				},
+			},
+			expectedHTTP: &dynamic.Spiffe{
+				IDs:         []string{"spiffe://trust.domain/http"},
+				TrustDomain: "http.trust.domain",
+			},
+			expectedTCP: &dynamic.Spiffe{
+				IDs:         []string{"spiffe://trust.domain/tcp"},
+				TrustDomain: "tcp.trust.domain",
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			provider := Provider{staticCfg: test.staticCfg}
+
+			cfg := provider.createConfiguration(t.Context())
+
+			httpServersTransport := cfg.HTTP.ServersTransports["default"]
+			require.NotNil(t, httpServersTransport)
+			assert.Equal(t, test.expectedHTTP, httpServersTransport.Spiffe)
+
+			tcpServersTransport := cfg.TCP.ServersTransports["default"]
+			require.NotNil(t, tcpServersTransport)
+			require.NotNil(t, tcpServersTransport.TLS)
+			assert.Equal(t, test.expectedTCP, tcpServersTransport.TLS.Spiffe)
 		})
 	}
 }

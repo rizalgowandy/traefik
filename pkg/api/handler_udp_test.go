@@ -1,19 +1,19 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/config/static"
 )
 
 func TestHandler_UDP(t *testing.T) {
@@ -173,6 +173,40 @@ func TestHandler_UDP(t *testing.T) {
 			},
 		},
 		{
+			desc: "UDP routers filtered by service",
+			path: "/api/udp/routers?serviceName=foo-service@myprovider",
+			conf: runtime.Configuration{
+				UDPRouters: map[string]*runtime.UDPRouterInfo{
+					"test@myprovider": {
+						UDPRouter: &dynamic.UDPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"bar@myprovider": {
+						UDPRouter: &dynamic.UDPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service",
+						},
+						Status: runtime.StatusWarning,
+					},
+					"foo@myprovider": {
+						UDPRouter: &dynamic.UDPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "bar-service@myprovider",
+						},
+						Status: runtime.StatusDisabled,
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				nextPage:   "1",
+				jsonFile:   "testdata/udprouters-filtered-serviceName.json",
+			},
+		},
+		{
 			desc: "one UDP router by id",
 			path: "/api/udp/routers/bar@myprovider",
 			conf: runtime.Configuration{
@@ -188,6 +222,24 @@ func TestHandler_UDP(t *testing.T) {
 			expected: expected{
 				statusCode: http.StatusOK,
 				jsonFile:   "testdata/udprouter-bar.json",
+			},
+		},
+		{
+			desc: "one UDP router by id containing slash",
+			path: "/api/udp/routers/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				UDPRouters: map[string]*runtime.UDPRouterInfo{
+					"foo / bar@myprovider": {
+						UDPRouter: &dynamic.UDPRouter{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+						},
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/udprouter-foo-slash-bar.json",
 			},
 		},
 		{
@@ -454,6 +506,30 @@ func TestHandler_UDP(t *testing.T) {
 			},
 		},
 		{
+			desc: "one udp service by id containing slash",
+			path: "/api/udp/services/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				UDPServices: map[string]*runtime.UDPServiceInfo{
+					"foo / bar@myprovider": {
+						UDPService: &dynamic.UDPService{
+							LoadBalancer: &dynamic.UDPServersLoadBalancer{
+								Servers: []dynamic.UDPServer{
+									{
+										Address: "127.0.0.1:2345",
+									},
+								},
+							},
+						},
+						UsedBy: []string{"foo@myprovider", "test@myprovider"},
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/udpservice-foo-slash-bar.json",
+			},
+		},
+		{
 			desc: "one udp service by id, that does not exist",
 			path: "/api/udp/services/nono@myprovider",
 			conf: runtime.Configuration{
@@ -487,14 +563,13 @@ func TestHandler_UDP(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			rtConf := &test.conf
 			// To lazily initialize the Statuses.
 			rtConf.PopulateUsedBy()
-			rtConf.GetUDPRoutersByEntryPoints(context.Background(), []string{"web"})
+			rtConf.GetUDPRoutersByEntryPoints(t.Context(), []string{"web"})
 
 			handler := New(static.Configuration{API: &static.API{}, Global: &static.Global{}}, rtConf)
 			server := httptest.NewServer(handler.createRouter())
@@ -510,7 +585,7 @@ func TestHandler_UDP(t *testing.T) {
 				return
 			}
 
-			assert.Equal(t, resp.Header.Get("Content-Type"), "application/json")
+			assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 
 			contents, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
@@ -519,7 +594,7 @@ func TestHandler_UDP(t *testing.T) {
 			require.NoError(t, err)
 
 			if *updateExpected {
-				var results interface{}
+				var results any
 				err := json.Unmarshal(contents, &results)
 				require.NoError(t, err)
 

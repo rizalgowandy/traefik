@@ -12,10 +12,7 @@ import (
 )
 
 func TestConsecutiveWrites(t *testing.T) {
-	addr, err := net.ResolveUDPAddr("udp", ":0")
-	require.NoError(t, err)
-
-	ln, err := Listen("udp", addr, 3*time.Second)
+	ln, err := Listen(net.ListenConfig{}, "udp", ":0", 3*time.Second)
 	require.NoError(t, err)
 	defer func() {
 		err := ln.Close()
@@ -73,11 +70,7 @@ func TestConsecutiveWrites(t *testing.T) {
 }
 
 func TestListenNotBlocking(t *testing.T) {
-	addr, err := net.ResolveUDPAddr("udp", ":0")
-
-	require.NoError(t, err)
-
-	ln, err := Listen("udp", addr, 3*time.Second)
+	ln, err := Listen(net.ListenConfig{}, "udp", ":0", 3*time.Second)
 	require.NoError(t, err)
 	defer func() {
 		err := ln.Close()
@@ -163,10 +156,7 @@ func TestListenNotBlocking(t *testing.T) {
 }
 
 func TestListenWithZeroTimeout(t *testing.T) {
-	addr, err := net.ResolveUDPAddr("udp", ":0")
-	require.NoError(t, err)
-
-	_, err = Listen("udp", addr, 0)
+	_, err := Listen(net.ListenConfig{}, "udp", ":0", 0)
 	assert.Error(t, err)
 }
 
@@ -181,10 +171,7 @@ func TestTimeoutWithoutRead(t *testing.T) {
 func testTimeout(t *testing.T, withRead bool) {
 	t.Helper()
 
-	addr, err := net.ResolveUDPAddr("udp", ":0")
-	require.NoError(t, err)
-
-	ln, err := Listen("udp", addr, 3*time.Second)
+	ln, err := Listen(net.ListenConfig{}, "udp", ":0", 3*time.Second)
 	require.NoError(t, err)
 	defer func() {
 		err := ln.Close()
@@ -208,7 +195,7 @@ func testTimeout(t *testing.T, withRead bool) {
 		}
 	}()
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		udpConn2, err := net.Dial("udp", ln.Addr().String())
 		require.NoError(t, err)
 
@@ -218,17 +205,14 @@ func testTimeout(t *testing.T, withRead bool) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	assert.Equal(t, 10, len(ln.conns))
+	assert.Len(t, ln.conns, 10)
 
 	time.Sleep(ln.timeout + time.Second)
-	assert.Equal(t, 0, len(ln.conns))
+	assert.Empty(t, ln.conns)
 }
 
 func TestShutdown(t *testing.T) {
-	addr, err := net.ResolveUDPAddr("udp", ":0")
-	require.NoError(t, err)
-
-	l, err := Listen("udp", addr, 3*time.Second)
+	l, err := Listen(net.ListenConfig{}, "udp", ":0", 3*time.Second)
 	require.NoError(t, err)
 
 	go func() {
@@ -266,12 +250,18 @@ func TestShutdown(t *testing.T) {
 	// Start sending packets, to create a "session" with the server.
 	requireEcho(t, "TEST", conn, time.Second)
 
+	shutdownStartedChan := make(chan struct{})
 	doneChan := make(chan struct{})
 	go func() {
+		close(shutdownStartedChan)
 		err := l.Shutdown(5 * time.Second)
 		require.NoError(t, err)
 		close(doneChan)
 	}()
+
+	// Wait until shutdown has started, and hopefully after 100 ms the listener has stopped accepting new sessions.
+	<-shutdownStartedChan
+	time.Sleep(100 * time.Millisecond)
 
 	// Make sure that our session is still live even after the shutdown.
 	requireEcho(t, "TEST2", conn, time.Second)

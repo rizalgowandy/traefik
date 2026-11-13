@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/tls/generate"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/types"
 )
 
 var (
@@ -35,23 +35,23 @@ var (
 	// Available CurveIDs defined at https://godoc.org/crypto/tls#CurveID,
 	// also allowing rfc names defined at https://tools.ietf.org/html/rfc8446#section-4.2.7
 	CurveIDs = map[string]tls.CurveID{
-		`secp256r1`: tls.CurveP256,
-		`CurveP256`: tls.CurveP256,
-		`secp384r1`: tls.CurveP384,
-		`CurveP384`: tls.CurveP384,
-		`secp521r1`: tls.CurveP521,
-		`CurveP521`: tls.CurveP521,
-		`x25519`:    tls.X25519,
-		`X25519`:    tls.X25519,
+		`secp256r1`:      tls.CurveP256,
+		`CurveP256`:      tls.CurveP256,
+		`secp384r1`:      tls.CurveP384,
+		`CurveP384`:      tls.CurveP384,
+		`secp521r1`:      tls.CurveP521,
+		`CurveP521`:      tls.CurveP521,
+		`x25519`:         tls.X25519,
+		`X25519`:         tls.X25519,
+		`x25519mlkem768`: tls.X25519MLKEM768,
+		`X25519MLKEM768`: tls.X25519MLKEM768,
+		// Post-quantum hybrid key exchanges enabled by default since Go 1.26.
+		`secp256r1mlkem768`:  tls.SecP256r1MLKEM768,
+		`SecP256r1MLKEM768`:  tls.SecP256r1MLKEM768,
+		`secp384r1mlkem1024`: tls.SecP384r1MLKEM1024,
+		`SecP384r1MLKEM1024`: tls.SecP384r1MLKEM1024,
 	}
 )
-
-// Certificate holds a SSL cert/key pair
-// Certs and Key could be either a file path, or the file content itself.
-type Certificate struct {
-	CertFile FileOrContent `json:"certFile,omitempty" toml:"certFile,omitempty" yaml:"certFile,omitempty"`
-	KeyFile  FileOrContent `json:"keyFile,omitempty" toml:"keyFile,omitempty" yaml:"keyFile,omitempty"`
-}
 
 // Certificates defines traefik certificates type
 // Certs and Keys could be either a file path, or the file content itself.
@@ -64,7 +64,7 @@ func (c Certificates) GetCertificates() []tls.Certificate {
 	for _, certificate := range c {
 		cert, err := certificate.GetCertificate()
 		if err != nil {
-			log.WithoutContext().Debugf("Error while getting certificate: %v", err)
+			log.Debug().Err(err).Msg("Error while getting certificate")
 			continue
 		}
 
@@ -72,6 +72,60 @@ func (c Certificates) GetCertificates() []tls.Certificate {
 	}
 
 	return certs
+}
+
+// Certificate holds a SSL cert/key pair
+// Certs and Key could be either a file path, or the file content itself.
+type Certificate struct {
+	CertFile types.FileOrContent `json:"certFile,omitempty" toml:"certFile,omitempty" yaml:"certFile,omitempty"`
+	KeyFile  types.FileOrContent `json:"keyFile,omitempty" toml:"keyFile,omitempty" yaml:"keyFile,omitempty" loggable:"false"`
+}
+
+// GetCertificate returns a tls.Certificate matching the configured CertFile and KeyFile.
+func (c *Certificate) GetCertificate() (tls.Certificate, error) {
+	certContent, err := c.CertFile.Read()
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("unable to read CertFile: %w", err)
+	}
+
+	keyContent, err := c.KeyFile.Read()
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("unable to read KeyFile: %w", err)
+	}
+
+	cert, err := tls.X509KeyPair(certContent, keyContent)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("unable to parse TLS certificate: %w", err)
+	}
+
+	return cert, nil
+}
+
+// GetCertificateFromBytes returns a tls.Certificate matching the configured CertFile and KeyFile.
+// It assumes that the configured CertFile and KeyFile are of byte type.
+func (c *Certificate) GetCertificateFromBytes() (tls.Certificate, error) {
+	cert, err := tls.X509KeyPair([]byte(c.CertFile), []byte(c.KeyFile))
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("unable to parse TLS certificate: %w", err)
+	}
+
+	return cert, nil
+}
+
+// GetTruncatedCertificateName returns an identifier for the certificate, to be used in logs and error messages.
+func (c *Certificate) GetTruncatedCertificateName() string {
+	certName := c.CertFile.String()
+	if c.CertFile.IsPath() {
+		return certName
+	}
+
+	// The content is of unknown nature: providers inline the CertFile before it reaches the TLS manager, a missing
+	// path is indistinguishable from inlined content, and the content may be a bundle carrying the private key.
+	// Both ends are excerpted, 16 characters being what it takes to read a PEM block type, and never more than half
+	// of the content, to keep a short one from being printed in full.
+	edge := min(len(certName)/4, 16)
+
+	return certName[:edge] + "[...]" + certName[len(certName)-edge:]
 }
 
 // FileOrContent hold a file path or content.
@@ -101,227 +155,50 @@ func (f FileOrContent) Read() ([]byte, error) {
 	return content, nil
 }
 
-// CreateTLSConfig creates a TLS config from Certificate structures.
-func (c *Certificates) CreateTLSConfig(entryPointName string) (*tls.Config, error) {
-	config := &tls.Config{}
-	domainsCertificates := make(map[string]map[string]*tls.Certificate)
+// SANType is the type of the Subject Alternative Name.
+type SANType string
 
-	if c.isEmpty() {
-		config.Certificates = []tls.Certificate{}
+const (
+	// SANDNSNameType specifies hostname-based SAN.
+	SANDNSNameType SANType = "DNSName"
 
-		cert, err := generate.DefaultCertificate()
-		if err != nil {
-			return nil, err
-		}
+	// SANURIType specifies URI-based SAN, e.g. SPIFFE id.
+	SANURIType SANType = "URI"
+)
 
-		config.Certificates = append(config.Certificates, *cert)
-	} else {
-		for _, certificate := range *c {
-			err := certificate.AppendCertificate(domainsCertificates, entryPointName)
-			if err != nil {
-				log.Errorf("Unable to add a certificate to the entryPoint %q : %v", entryPointName, err)
-				continue
-			}
+// +k8s:deepcopy-gen=true
 
-			for _, certDom := range domainsCertificates {
-				for _, cert := range certDom {
-					config.Certificates = append(config.Certificates, *cert)
-				}
-			}
-		}
-	}
-	return config, nil
-}
-
-// isEmpty checks if the certificates list is empty.
-func (c *Certificates) isEmpty() bool {
-	if len(*c) == 0 {
-		return true
-	}
-	var key int
-	for _, cert := range *c {
-		if len(cert.CertFile.String()) != 0 && len(cert.KeyFile.String()) != 0 {
-			break
-		}
-		key++
-	}
-	return key == len(*c)
-}
-
-// AppendCertificate appends a Certificate to a certificates map keyed by entrypoint.
-func (c *Certificate) AppendCertificate(certs map[string]map[string]*tls.Certificate, ep string) error {
-	certContent, err := c.CertFile.Read()
-	if err != nil {
-		return fmt.Errorf("unable to read CertFile : %w", err)
-	}
-
-	keyContent, err := c.KeyFile.Read()
-	if err != nil {
-		return fmt.Errorf("unable to read KeyFile : %w", err)
-	}
-	tlsCert, err := tls.X509KeyPair(certContent, keyContent)
-	if err != nil {
-		return fmt.Errorf("unable to generate TLS certificate : %w", err)
-	}
-
-	parsedCert, _ := x509.ParseCertificate(tlsCert.Certificate[0])
-
-	var SANs []string
-	if parsedCert.Subject.CommonName != "" {
-		SANs = append(SANs, strings.ToLower(parsedCert.Subject.CommonName))
-	}
-	if parsedCert.DNSNames != nil {
-		sort.Strings(parsedCert.DNSNames)
-		for _, dnsName := range parsedCert.DNSNames {
-			if dnsName != parsedCert.Subject.CommonName {
-				SANs = append(SANs, strings.ToLower(dnsName))
-			}
-		}
-	}
-	if parsedCert.IPAddresses != nil {
-		for _, ip := range parsedCert.IPAddresses {
-			if ip.String() != parsedCert.Subject.CommonName {
-				SANs = append(SANs, strings.ToLower(ip.String()))
-			}
-		}
-	}
-	certKey := strings.Join(SANs, ",")
-
-	certExists := false
-	if certs[ep] == nil {
-		certs[ep] = make(map[string]*tls.Certificate)
-	} else {
-		for domains := range certs[ep] {
-			if domains == certKey {
-				certExists = true
-				break
-			}
-		}
-	}
-	if certExists {
-		log.Debugf("Skipping addition of certificate for domain(s) %q, to EntryPoint %s, as it already exists for this Entrypoint.", certKey, ep)
-	} else {
-		log.Debugf("Adding certificate for domain(s) %s", certKey)
-		certs[ep][certKey] = &tlsCert
-	}
-
-	return err
-}
-
-// GetCertificate retrieves Certificate as tls.Certificate.
-func (c *Certificate) GetCertificate() (tls.Certificate, error) {
-	certContent, err := c.CertFile.Read()
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("unable to read CertFile : %w", err)
-	}
-
-	keyContent, err := c.KeyFile.Read()
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("unable to read KeyFile : %w", err)
-	}
-
-	cert, err := tls.X509KeyPair(certContent, keyContent)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("unable to generate TLS certificate : %w", err)
-	}
-
-	return cert, nil
-}
-
-// GetTruncatedCertificateName truncates the certificate name.
-func (c *Certificate) GetTruncatedCertificateName() string {
-	certName := c.CertFile.String()
-
-	// Truncate certificate information only if it's a well formed certificate content with more than 50 characters
-	if !c.CertFile.IsPath() && strings.HasPrefix(certName, certificateHeader) && len(certName) > len(certificateHeader)+50 {
-		certName = strings.TrimPrefix(c.CertFile.String(), certificateHeader)[:50]
-	}
-
-	return certName
-}
-
-// String is the method to format the flag's value, part of the flag.Value interface.
-// The String method's output will be used in diagnostics.
-func (c *Certificates) String() string {
-	if len(*c) == 0 {
-		return ""
-	}
-	var result []string
-	for _, certificate := range *c {
-		result = append(result, certificate.CertFile.String()+","+certificate.KeyFile.String())
-	}
-	return strings.Join(result, ";")
-}
-
-// Set is the method to set the flag value, part of the flag.Value interface.
-// Set's argument is a string to be parsed to set the flag.
-// It's a comma-separated list, so we split it.
-func (c *Certificates) Set(value string) error {
-	certificates := strings.Split(value, ";")
-	for _, certificate := range certificates {
-		files := strings.Split(certificate, ",")
-		if len(files) != 2 {
-			return fmt.Errorf("bad certificates format: %s", value)
-		}
-		*c = append(*c, Certificate{
-			CertFile: FileOrContent(files[0]),
-			KeyFile:  FileOrContent(files[1]),
-		})
-	}
-	return nil
-}
-
-// Type is type of the struct.
-func (c *Certificates) Type() string {
-	return "certificates"
+// SAN represents a Subject Alternative Name.
+type SAN struct {
+	Type  SANType `json:"type,omitempty" toml:"type,omitempty" yaml:"type,omitempty"`
+	Value string  `json:"value,omitempty" toml:"value,omitempty" yaml:"value,omitempty"`
 }
 
 // VerifyPeerCertificate verifies the chain certificates and their URI.
-func VerifyPeerCertificate(uri string, cfg *tls.Config, rawCerts [][]byte) error {
+func VerifyPeerCertificate(sans []SAN, rootCAs *x509.CertPool, rawCerts [][]byte) error {
 	// TODO: Refactor to avoid useless verifyChain (ex: when insecureskipverify is false)
-	cert, err := verifyChain(cfg.RootCAs, rawCerts)
+	cert, err := verifyChain(rootCAs, rawCerts)
 	if err != nil {
-		return err
+		return fmt.Errorf("verifying chain: %w", err)
 	}
 
-	if len(uri) > 0 {
-		return verifyServerCertMatchesURI(uri, cert)
+	for _, san := range sans {
+		switch san.Type {
+		case SANURIType:
+			if slices.ContainsFunc(cert.URIs, func(uri *url.URL) bool {
+				return strings.EqualFold(san.Value, uri.String())
+			}) {
+				return nil
+			}
+
+		case SANDNSNameType:
+			if err := cert.VerifyHostname(san.Value); err == nil {
+				return nil
+			}
+		}
 	}
 
-	return nil
-}
-
-// verifyServerCertMatchesURI is used on tls connections dialed to a server
-// to ensure that the certificate it presented has the correct URI.
-func verifyServerCertMatchesURI(uri string, cert *x509.Certificate) error {
-	if cert == nil {
-		return errors.New("peer certificate mismatch: no peer certificate presented")
-	}
-
-	// Our certs will only ever have a single URI for now so only check that
-	if len(cert.URIs) < 1 {
-		return errors.New("peer certificate mismatch: peer certificate invalid")
-	}
-
-	gotURI := cert.URIs[0]
-
-	// Override the hostname since we rely on x509 constraints to limit ability to spoof the trust domain if needed
-	// (i.e. because a root is shared with other PKI or Consul clusters).
-	// This allows for seamless migrations between trust domains.
-
-	expectURI := &url.URL{}
-	id, err := url.Parse(uri)
-	if err != nil {
-		return fmt.Errorf("%q is not a valid URI", uri)
-	}
-	*expectURI = *id
-	expectURI.Host = gotURI.Host
-
-	if strings.EqualFold(gotURI.String(), expectURI.String()) {
-		return nil
-	}
-
-	return fmt.Errorf("peer certificate mismatch got %s, want %s", gotURI, uri)
+	return errors.New("no matching SAN in peer certificate")
 }
 
 // verifyChain performs standard TLS verification without enforcing remote hostname matching.

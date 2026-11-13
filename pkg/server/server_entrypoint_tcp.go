@@ -2,42 +2,76 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"expvar"
 	"fmt"
 	stdlog "log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/containous/alice"
+	gokitmetrics "github.com/go-kit/kit/metrics"
 	"github.com/pires/go-proxyproto"
-	"github.com/sirupsen/logrus"
-	"github.com/traefik/traefik/v2/pkg/config/static"
-	"github.com/traefik/traefik/v2/pkg/ip"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/middlewares"
-	"github.com/traefik/traefik/v2/pkg/middlewares/forwardedheaders"
-	"github.com/traefik/traefik/v2/pkg/safe"
-	"github.com/traefik/traefik/v2/pkg/server/router"
-	"github.com/traefik/traefik/v2/pkg/tcp"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/ip"
+	"github.com/traefik/traefik/v3/pkg/middlewares"
+	"github.com/traefik/traefik/v3/pkg/middlewares/contenttype"
+	"github.com/traefik/traefik/v3/pkg/middlewares/forwardedheaders"
+	"github.com/traefik/traefik/v3/pkg/middlewares/requestdecorator"
+	"github.com/traefik/traefik/v3/pkg/observability/logs"
+	"github.com/traefik/traefik/v3/pkg/observability/metrics"
+	"github.com/traefik/traefik/v3/pkg/proxy/fast"
+	"github.com/traefik/traefik/v3/pkg/safe"
+	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
+	"github.com/traefik/traefik/v3/pkg/server/service/kerberos"
+	"github.com/traefik/traefik/v3/pkg/tcp"
+	"github.com/traefik/traefik/v3/pkg/types"
 )
 
-var httpServerLogger = stdlog.New(log.WithoutContext().WriterLevel(logrus.DebugLevel), "", 0)
+type key string
+
+const (
+	connStateKey       key    = "connState"
+	debugConnectionEnv string = "DEBUG_CONNECTION"
+)
+
+var (
+	clientConnectionStates   = map[string]*connState{}
+	clientConnectionStatesMu = sync.RWMutex{}
+)
+
+type connState struct {
+	State            string
+	KeepAliveState   string
+	Start            time.Time
+	HTTPRequestCount int
+}
 
 type httpForwarder struct {
 	net.Listener
-	connChan chan net.Conn
-	errChan  chan error
+
+	connChan  chan net.Conn
+	errChan   chan error
+	closeChan chan struct{}
+	closeOnce sync.Once
 }
 
 func newHTTPForwarder(ln net.Listener) *httpForwarder {
 	return &httpForwarder{
-		Listener: ln,
-		connChan: make(chan net.Conn),
-		errChan:  make(chan error),
+		Listener:  ln,
+		connChan:  make(chan net.Conn),
+		errChan:   make(chan error),
+		closeChan: make(chan struct{}),
 	}
 }
 
@@ -49,6 +83,8 @@ func (h *httpForwarder) ServeTCP(conn tcp.WriteCloser) {
 // Accept retrieves a served connection in ServeTCP.
 func (h *httpForwarder) Accept() (net.Conn, error) {
 	select {
+	case <-h.closeChan:
+		return nil, errors.New("listener closed")
 	case conn := <-h.connChan:
 		return conn, nil
 	case err := <-h.errChan:
@@ -56,11 +92,25 @@ func (h *httpForwarder) Accept() (net.Conn, error) {
 	}
 }
 
+// Close closes the wrapped listener and unblocks Accept.
+func (h *httpForwarder) Close() error {
+	h.closeOnce.Do(func() {
+		close(h.closeChan)
+	})
+	return h.Listener.Close()
+}
+
 // TCPEntryPoints holds a map of TCPEntryPoint (the entrypoint names being the keys).
 type TCPEntryPoints map[string]*TCPEntryPoint
 
 // NewTCPEntryPoints creates a new TCPEntryPoints.
-func NewTCPEntryPoints(entryPointsConfig static.EntryPoints) (TCPEntryPoints, error) {
+func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig *types.HostResolverConfig, metricsRegistry metrics.Registry) (TCPEntryPoints, error) {
+	if os.Getenv(debugConnectionEnv) != "" {
+		expvar.Publish("clientConnectionStates", expvar.Func(func() any {
+			return clientConnectionStates
+		}))
+	}
+
 	serverEntryPointsTCP := make(TCPEntryPoints)
 	for entryPointName, config := range entryPointsConfig {
 		protocol, err := config.GetProtocol()
@@ -72,9 +122,13 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints) (TCPEntryPoints, er
 			continue
 		}
 
-		ctx := log.With(context.Background(), log.Str(log.EntryPointName, entryPointName))
+		ctx := log.With().Str(logs.EntryPointName, entryPointName).Logger().WithContext(context.Background())
 
-		serverEntryPointsTCP[entryPointName], err = NewTCPEntryPoint(ctx, config)
+		openConnectionsGauge := metricsRegistry.
+			OpenConnectionsGauge().
+			With("entrypoint", entryPointName, "protocol", "TCP")
+
+		serverEntryPointsTCP[entryPointName], err = NewTCPEntryPoint(ctx, entryPointName, config, hostResolverConfig, openConnectionsGauge)
 		if err != nil {
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
@@ -85,7 +139,7 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints) (TCPEntryPoints, er
 // Start the server entry points.
 func (eps TCPEntryPoints) Start() {
 	for entryPointName, serverEntryPoint := range eps {
-		ctx := log.With(context.Background(), log.Str(log.EntryPointName, entryPointName))
+		ctx := log.With().Str(logs.EntryPointName, entryPointName).Logger().WithContext(context.Background())
 		go serverEntryPoint.Start(ctx)
 	}
 }
@@ -95,23 +149,19 @@ func (eps TCPEntryPoints) Stop() {
 	var wg sync.WaitGroup
 
 	for epn, ep := range eps {
-		wg.Add(1)
+		wg.Go(func() {
+			logger := log.With().Str(logs.EntryPointName, epn).Logger()
+			ep.Shutdown(logger.WithContext(context.Background()))
 
-		go func(entryPointName string, entryPoint *TCPEntryPoint) {
-			defer wg.Done()
-
-			ctx := log.With(context.Background(), log.Str(log.EntryPointName, entryPointName))
-			entryPoint.Shutdown(ctx)
-
-			log.FromContext(ctx).Debugf("Entry point %s closed", entryPointName)
-		}(epn, ep)
+			logger.Debug().Msg("Entrypoint closed")
+		})
 	}
 
 	wg.Wait()
 }
 
 // Switch the TCP routers.
-func (eps TCPEntryPoints) Switch(routersTCP map[string]*tcp.Router) {
+func (eps TCPEntryPoints) Switch(routersTCP map[string]*tcprouter.Router) {
 	for entryPointName, rt := range routersTCP {
 		eps[entryPointName].SwitchRouter(rt)
 	}
@@ -125,39 +175,49 @@ type TCPEntryPoint struct {
 	tracker                *connectionTracker
 	httpServer             *httpServer
 	httpsServer            *httpServer
-
-	http3Server *http3server
+	http3Server            *http3server
+	// inShutdown reports whether the Shutdown method has been called.
+	inShutdown atomic.Bool
 }
 
 // NewTCPEntryPoint creates a new TCPEntryPoint.
-func NewTCPEntryPoint(ctx context.Context, configuration *static.EntryPoint) (*TCPEntryPoint, error) {
-	tracker := newConnectionTracker()
+func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoint, hostResolverConfig *types.HostResolverConfig, openConnectionsGauge gokitmetrics.Gauge) (*TCPEntryPoint, error) {
+	tracker := newConnectionTracker(openConnectionsGauge)
 
-	listener, err := buildListener(ctx, configuration)
+	listener, err := buildListener(ctx, name, config)
 	if err != nil {
-		return nil, fmt.Errorf("error preparing server: %w", err)
+		return nil, fmt.Errorf("building listener: %w", err)
 	}
 
-	rt := &tcp.Router{}
-
-	httpServer, err := createHTTPServer(ctx, listener, configuration, true)
+	rt, err := tcprouter.NewRouter(nil)
 	if err != nil {
-		return nil, fmt.Errorf("error preparing httpServer: %w", err)
+		return nil, fmt.Errorf("creating TCP router: %w", err)
 	}
 
-	rt.HTTPForwarder(httpServer.Forwarder)
+	reqDecorator := requestdecorator.New(hostResolverConfig)
 
-	httpsServer, err := createHTTPServer(ctx, listener, configuration, false)
+	// The header names strategies warnings are logged here, and not in newHTTPServer,
+	// which is called once for the HTTP server and once for the HTTPS server.
+	logHeaderNamesStrategiesWarnings(ctx, config)
+
+	httpServer, err := newHTTPServer(ctx, listener, config, true, reqDecorator)
 	if err != nil {
-		return nil, fmt.Errorf("error preparing httpsServer: %w", err)
+		return nil, fmt.Errorf("creating HTTP server: %w", err)
 	}
 
-	h3server, err := newHTTP3Server(ctx, configuration, httpsServer)
+	rt.SetHTTPForwarder(httpServer.Forwarder)
+
+	httpsServer, err := newHTTPServer(ctx, listener, config, false, reqDecorator)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating HTTPS server: %w", err)
 	}
 
-	rt.HTTPSForwarder(httpsServer.Forwarder)
+	h3Server, err := newHTTP3Server(ctx, name, config, httpsServer)
+	if err != nil {
+		return nil, fmt.Errorf("creating HTTP3 server: %w", err)
+	}
+
+	rt.SetHTTPSForwarder(httpsServer.Forwarder)
 
 	tcpSwitcher := &tcp.HandlerSwitcher{}
 	tcpSwitcher.Switch(rt)
@@ -165,18 +225,36 @@ func NewTCPEntryPoint(ctx context.Context, configuration *static.EntryPoint) (*T
 	return &TCPEntryPoint{
 		listener:               listener,
 		switcher:               tcpSwitcher,
-		transportConfiguration: configuration.Transport,
+		transportConfiguration: config.Transport,
 		tracker:                tracker,
 		httpServer:             httpServer,
 		httpsServer:            httpsServer,
-		http3Server:            h3server,
+		http3Server:            h3Server,
 	}, nil
+}
+
+// logHeaderNamesStrategiesWarnings warns about the deprecated underscoreHeadersStrategy option,
+// and about the entry points left without the aliasHeadersStrategy option configured.
+func logHeaderNamesStrategiesWarnings(ctx context.Context, configuration *static.EntryPoint) {
+	if configuration.HTTP.UnderscoreHeadersStrategy != "" {
+		log.Ctx(ctx).Warn().Msg("The underscoreHeadersStrategy option is deprecated, please use the aliasHeadersStrategy option instead. " +
+			"The underscoreHeadersStrategy option only handles the header names containing an underscore character, " +
+			"whereas the aliasHeadersStrategy option handles every header name aliasing another one.")
+	}
+
+	if configuration.HTTP.AliasHeadersStrategy == "" &&
+		(configuration.HTTP.UnderscoreHeadersStrategy == "" || configuration.HTTP.UnderscoreHeadersStrategy == static.UnderscoreHeadersStrategyKeep) {
+		log.Ctx(ctx).Warn().Msg("aliasHeadersStrategy is not configured: the request headers whose name aliases another header name " +
+			"(e.g. X_Auth_User or X.Auth.User for X-Auth-User) are forwarded as is. The backends deriving variable names from the header " +
+			"names (CGI, WSGI, PHP, NGINX, ...) read them as the header they alias, which allows a client to spoof the headers Traefik manages. " +
+			"Please set it to delete or reject on the entry points fronting such backends.")
+	}
 }
 
 // Start starts the TCP server.
 func (e *TCPEntryPoint) Start(ctx context.Context) {
-	logger := log.FromContext(ctx)
-	logger.Debugf("Start TCP Server")
+	logger := log.Ctx(ctx)
+	logger.Debug().Msg("Starting TCP Server")
 
 	if e.http3Server != nil {
 		go func() { _ = e.http3Server.Start() }()
@@ -184,11 +262,19 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 
 	for {
 		conn, err := e.listener.Accept()
+		// As the Shutdown method has been called, an error is expected.
+		// Thus, it is not necessary to log it.
+		if err != nil && e.inShutdown.Load() {
+			return
+		}
 		if err != nil {
-			logger.Error(err)
+			logger.Error().Err(err).Send()
 
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Temporary() {
+			if opErr, ok := errors.AsType[*net.OpError](err); ok && opErr.Temporary() {
+				continue
+			}
+
+			if urlErr, ok := errors.AsType[*url.Error](err); ok && urlErr.Temporary() {
 				continue
 			}
 
@@ -210,14 +296,14 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 			if e.transportConfiguration.RespondingTimeouts.ReadTimeout > 0 {
 				err := writeCloser.SetReadDeadline(time.Now().Add(time.Duration(e.transportConfiguration.RespondingTimeouts.ReadTimeout)))
 				if err != nil {
-					logger.Errorf("Error while setting read deadline: %v", err)
+					logger.Error().Err(err).Msg("Error while setting read deadline")
 				}
 			}
 
 			if e.transportConfiguration.RespondingTimeouts.WriteTimeout > 0 {
 				err = writeCloser.SetWriteDeadline(time.Now().Add(time.Duration(e.transportConfiguration.RespondingTimeouts.WriteTimeout)))
 				if err != nil {
-					logger.Errorf("Error while setting write deadline: %v", err)
+					logger.Error().Err(err).Msg("Error while setting write deadline")
 				}
 			}
 
@@ -228,67 +314,65 @@ func (e *TCPEntryPoint) Start(ctx context.Context) {
 
 // Shutdown stops the TCP connections.
 func (e *TCPEntryPoint) Shutdown(ctx context.Context) {
-	logger := log.FromContext(ctx)
+	logger := log.Ctx(ctx)
+
+	e.inShutdown.Store(true)
 
 	reqAcceptGraceTimeOut := time.Duration(e.transportConfiguration.LifeCycle.RequestAcceptGraceTimeout)
 	if reqAcceptGraceTimeOut > 0 {
-		logger.Infof("Waiting %s for incoming requests to cease", reqAcceptGraceTimeOut)
+		logger.Info().Msgf("Waiting %s for incoming requests to cease", reqAcceptGraceTimeOut)
 		time.Sleep(reqAcceptGraceTimeOut)
 	}
 
 	graceTimeOut := time.Duration(e.transportConfiguration.LifeCycle.GraceTimeOut)
 	ctx, cancel := context.WithTimeout(ctx, graceTimeOut)
-	logger.Debugf("Waiting %s seconds before killing connections.", graceTimeOut)
+	logger.Debug().Msgf("Waiting %s seconds before killing connections", graceTimeOut)
 
 	var wg sync.WaitGroup
 
 	shutdownServer := func(server stoppable) {
-		defer wg.Done()
 		err := server.Shutdown(ctx)
 		if err == nil {
 			return
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			logger.Debugf("Server failed to shutdown within deadline because: %s", err)
+			logger.Debug().Err(err).Msg("Server failed to shutdown within deadline")
 			if err = server.Close(); err != nil {
-				logger.Error(err)
+				logger.Error().Err(err).Send()
 			}
 			return
 		}
-		logger.Error(err)
+
+		logger.Error().Err(err).Send()
+
 		// We expect Close to fail again because Shutdown most likely failed when trying to close a listener.
 		// We still call it however, to make sure that all connections get closed as well.
 		server.Close()
 	}
 
 	if e.httpServer.Server != nil {
-		wg.Add(1)
-		go shutdownServer(e.httpServer.Server)
+		wg.Go(func() { shutdownServer(e.httpServer.Server) })
 	}
 
 	if e.httpsServer.Server != nil {
-		wg.Add(1)
-		go shutdownServer(e.httpsServer.Server)
+		wg.Go(func() { shutdownServer(e.httpsServer.Server) })
 
 		if e.http3Server != nil {
-			wg.Add(1)
-			go shutdownServer(e.http3Server)
+			wg.Go(func() { shutdownServer(e.http3Server) })
 		}
 	}
 
 	if e.tracker != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			err := e.tracker.Shutdown(ctx)
 			if err == nil {
 				return
 			}
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				logger.Debugf("Server failed to shutdown before deadline because: %s", err)
+				logger.Debug().Err(err).Msg("Server failed to shutdown before deadline")
 			}
 			e.tracker.Close()
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -296,21 +380,21 @@ func (e *TCPEntryPoint) Shutdown(ctx context.Context) {
 }
 
 // SwitchRouter switches the TCP router handler.
-func (e *TCPEntryPoint) SwitchRouter(rt *tcp.Router) {
-	rt.HTTPForwarder(e.httpServer.Forwarder)
+func (e *TCPEntryPoint) SwitchRouter(rt *tcprouter.Router) {
+	rt.SetHTTPForwarder(e.httpServer.Forwarder)
 
 	httpHandler := rt.GetHTTPHandler()
 	if httpHandler == nil {
-		httpHandler = router.BuildDefaultHTTPRouter()
+		httpHandler = http.NotFoundHandler()
 	}
 
 	e.httpServer.Switcher.UpdateHandler(httpHandler)
 
-	rt.HTTPSForwarder(e.httpsServer.Forwarder)
+	rt.SetHTTPSForwarder(e.httpsServer.Forwarder)
 
 	httpsHandler := rt.GetHTTPSHandler()
 	if httpsHandler == nil {
-		httpsHandler = router.BuildDefaultHTTPRouter()
+		httpsHandler = http.NotFoundHandler()
 	}
 
 	e.httpsServer.Switcher.UpdateHandler(httpsHandler)
@@ -326,6 +410,7 @@ func (e *TCPEntryPoint) SwitchRouter(rt *tcp.Router) {
 // connection type that was found to satisfy WriteCloser.
 type writeCloserWrapper struct {
 	net.Conn
+
 	writeCloser tcp.WriteCloser
 }
 
@@ -340,7 +425,7 @@ func writeCloser(conn net.Conn) (tcp.WriteCloser, error) {
 	case *proxyproto.Conn:
 		underlying, ok := typedConn.TCPConn()
 		if !ok {
-			return nil, fmt.Errorf("underlying connection is not a tcp connection")
+			return nil, errors.New("underlying connection is not a tcp connection")
 		}
 		return &writeCloserWrapper{writeCloser: underlying, Conn: typedConn}, nil
 	case *net.TCPConn:
@@ -367,8 +452,7 @@ func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
 	}
 
 	if err := tc.SetKeepAlivePeriod(3 * time.Minute); err != nil {
-		// Some systems, such as OpenBSD, have no user-settable per-socket TCP
-		// keepalive options.
+		// Some systems, such as OpenBSD, have no user-settable per-socket TCP keepalive options.
 		if !errors.Is(err, syscall.ENOPROTOOPT) {
 			return nil, err
 		}
@@ -378,10 +462,15 @@ func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
 }
 
 func buildProxyProtocolListener(ctx context.Context, entryPoint *static.EntryPoint, listener net.Listener) (net.Listener, error) {
-	proxyListener := &proxyproto.Listener{Listener: listener}
+	timeout := entryPoint.Transport.RespondingTimeouts.ReadTimeout
+	// proxyproto use 200ms if ReadHeaderTimeout is set to 0 and not no timeout
+	if timeout == 0 {
+		timeout = -1
+	}
+	proxyListener := &proxyproto.Listener{Listener: listener, ReadHeaderTimeout: time.Duration(timeout)}
 
 	if entryPoint.ProxyProtocol.Insecure {
-		log.FromContext(ctx).Infof("Enabling ProxyProtocol without trusted IPs: Insecure")
+		log.Ctx(ctx).Info().Msg("Enabling ProxyProtocol without trusted IPs: Insecure")
 		return proxyListener, nil
 	}
 
@@ -397,63 +486,97 @@ func buildProxyProtocolListener(ctx context.Context, entryPoint *static.EntryPoi
 		}
 
 		if !checker.ContainsIP(ipAddr.IP) {
-			log.FromContext(ctx).Debugf("IP %s is not in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", ipAddr.IP)
+			log.Ctx(ctx).Debug().Msgf("IP %s is not in trusted IPs list, ignoring ProxyProtocol Headers and bypass connection", ipAddr.IP)
 			return proxyproto.IGNORE, nil
 		}
 		return proxyproto.USE, nil
 	}
 
-	log.FromContext(ctx).Infof("Enabling ProxyProtocol for trusted IPs %v", entryPoint.ProxyProtocol.TrustedIPs)
+	log.Ctx(ctx).Info().Msgf("Enabling ProxyProtocol for trusted IPs %v", entryPoint.ProxyProtocol.TrustedIPs)
 
 	return proxyListener, nil
 }
 
-func buildListener(ctx context.Context, entryPoint *static.EntryPoint) (net.Listener, error) {
-	listener, err := net.Listen("tcp", entryPoint.GetAddress())
-	if err != nil {
-		return nil, fmt.Errorf("error opening listener: %w", err)
+type onceCloseListener struct {
+	net.Listener
+
+	once     sync.Once
+	closeErr error
+}
+
+func (oc *onceCloseListener) Close() error {
+	oc.once.Do(func() { oc.closeErr = oc.Listener.Close() })
+	return oc.closeErr
+}
+
+func buildListener(ctx context.Context, name string, config *static.EntryPoint) (net.Listener, error) {
+	var listener net.Listener
+	var err error
+
+	// if we have predefined listener from socket activation
+	if socketActivation.isEnabled() {
+		listener, err = socketActivation.getListener(name)
+		if err != nil {
+			log.Ctx(ctx).Warn().Err(err).Str("name", name).Msg("Unable to use socket activation for entrypoint")
+		}
+	}
+
+	if listener == nil {
+		listenConfig := newListenConfig(config)
+
+		// TODO: Look into configuring keepAlive period through listenConfig instead of our custom tcpKeepAliveListener, to reactivate MultipathTCP?
+		// MultipathTCP is not supported on all platforms, and is notably unsupported in combination with TCP keep-alive.
+		if !strings.Contains(os.Getenv("GODEBUG"), "multipathtcp") {
+			listenConfig.SetMultipathTCP(false)
+		}
+
+		listener, err = listenConfig.Listen(ctx, "tcp", config.GetAddress())
+		if err != nil {
+			return nil, fmt.Errorf("error opening listener: %w", err)
+		}
 	}
 
 	listener = tcpKeepAliveListener{listener.(*net.TCPListener)}
 
-	if entryPoint.ProxyProtocol != nil {
-		listener, err = buildProxyProtocolListener(ctx, entryPoint, listener)
+	if config.ProxyProtocol != nil {
+		listener, err = buildProxyProtocolListener(ctx, config, listener)
 		if err != nil {
 			return nil, fmt.Errorf("error creating proxy protocol listener: %w", err)
 		}
 	}
-	return listener, nil
+	return &onceCloseListener{Listener: listener}, nil
 }
 
-func newConnectionTracker() *connectionTracker {
+func newConnectionTracker(openConnectionsGauge gokitmetrics.Gauge) *connectionTracker {
 	return &connectionTracker{
-		conns: make(map[net.Conn]struct{}),
+		conns:                make(map[net.Conn]struct{}),
+		openConnectionsGauge: openConnectionsGauge,
 	}
 }
 
 type connectionTracker struct {
-	conns map[net.Conn]struct{}
-	lock  sync.RWMutex
+	connsMu sync.RWMutex
+	conns   map[net.Conn]struct{}
+
+	openConnectionsGauge gokitmetrics.Gauge
 }
 
 // AddConnection add a connection in the tracked connections list.
 func (c *connectionTracker) AddConnection(conn net.Conn) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	defer c.syncOpenConnectionGauge()
+
+	c.connsMu.Lock()
 	c.conns[conn] = struct{}{}
+	c.connsMu.Unlock()
 }
 
 // RemoveConnection remove a connection from the tracked connections list.
 func (c *connectionTracker) RemoveConnection(conn net.Conn) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	delete(c.conns, conn)
-}
+	defer c.syncOpenConnectionGauge()
 
-func (c *connectionTracker) isEmpty() bool {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	return len(c.conns) == 0
+	c.connsMu.Lock()
+	delete(c.conns, conn)
+	c.connsMu.Unlock()
 }
 
 // Shutdown wait for the connection closing.
@@ -474,18 +597,35 @@ func (c *connectionTracker) Shutdown(ctx context.Context) error {
 
 // Close close all the connections in the tracked connections list.
 func (c *connectionTracker) Close() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.connsMu.Lock()
+	defer c.connsMu.Unlock()
 	for conn := range c.conns {
 		if err := conn.Close(); err != nil {
-			log.WithoutContext().Errorf("Error while closing connection: %v", err)
+			log.Error().Err(err).Msg("Error while closing connection")
 		}
 		delete(c.conns, conn)
 	}
 }
 
+// syncOpenConnectionGauge updates openConnectionsGauge value with the conns map length.
+func (c *connectionTracker) syncOpenConnectionGauge() {
+	if c.openConnectionsGauge == nil {
+		return
+	}
+
+	c.connsMu.RLock()
+	c.openConnectionsGauge.Set(float64(len(c.conns)))
+	c.connsMu.RUnlock()
+}
+
+func (c *connectionTracker) isEmpty() bool {
+	c.connsMu.RLock()
+	defer c.connsMu.RUnlock()
+	return len(c.conns) == 0
+}
+
 type stoppable interface {
-	Shutdown(context.Context) error
+	Shutdown(ctx context.Context) error
 	Close() error
 }
 
@@ -500,37 +640,174 @@ type httpServer struct {
 	Switcher  *middlewares.HTTPHandlerSwitcher
 }
 
-func createHTTPServer(ctx context.Context, ln net.Listener, configuration *static.EntryPoint, withH2c bool) (*httpServer, error) {
-	httpSwitcher := middlewares.NewHandlerSwitcher(router.BuildDefaultHTTPRouter())
+func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.EntryPoint, withH2c bool, reqDecorator *requestdecorator.RequestDecorator) (*httpServer, error) {
+	if configuration.HTTP2.MaxConcurrentStreams < 0 {
+		return nil, errors.New("max concurrent streams value must be greater than or equal to zero")
+	}
+	if configuration.HTTP2.MaxDecoderHeaderTableSize < 0 {
+		return nil, errors.New("max decoder header table size value must be greater than or equal to zero")
+	}
+	if configuration.HTTP2.MaxEncoderHeaderTableSize < 0 {
+		return nil, errors.New("max encoder header table size value must be greater than or equal to zero")
+	}
 
-	var handler http.Handler
-	var err error
-	handler, err = forwardedheaders.NewXForwarded(
-		configuration.ForwardedHeaders.Insecure,
-		configuration.ForwardedHeaders.TrustedIPs,
-		httpSwitcher)
+	httpSwitcher := middlewares.NewHandlerSwitcher(http.NotFoundHandler())
 
+	next, err := alice.New(requestdecorator.WrapHandler(reqDecorator)).Then(httpSwitcher)
 	if err != nil {
 		return nil, err
 	}
 
-	if withH2c {
-		handler = h2c.NewHandler(handler, &http2.Server{})
+	var handler http.Handler
+	handler, err = forwardedheaders.NewXForwarded(
+		configuration.ForwardedHeaders.Insecure,
+		configuration.ForwardedHeaders.TrustedIPs,
+		configuration.ForwardedHeaders.Connection,
+		configuration.ForwardedHeaders.NotAppendXForwardedFor,
+		configuration.ForwardedHeaders.AddXForwardedSchemeHeaders,
+		next)
+	if err != nil {
+		return nil, err
+	}
+
+	debugConnection := os.Getenv(debugConnectionEnv) != ""
+	if debugConnection || (configuration.Transport != nil && (configuration.Transport.KeepAliveMaxTime > 0 || configuration.Transport.KeepAliveMaxRequests > 0)) {
+		handler = newKeepAliveMiddleware(handler, configuration.Transport.KeepAliveMaxRequests, configuration.Transport.KeepAliveMaxTime)
+	}
+
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+
+	// With the addition of UnencryptedHTTP2 in http.Server#Protocols in go1.24 setting the h2c handler is not necessary anymore.
+	protocols.SetUnencryptedHTTP2(withH2c)
+
+	handler = contenttype.DisableAutoDetection(handler)
+
+	if configuration.HTTP.EncodeQuerySemicolons {
+		handler = encodeQuerySemicolons(handler)
+	} else {
+		handler = http.AllowQuerySemicolons(handler)
+	}
+
+	// Note that the Path sanitization has to be done after the path normalization,
+	// hence the wrapping has to be done before the normalize path wrapping.
+	if configuration.HTTP.SanitizePath != nil && *configuration.HTTP.SanitizePath {
+		handler = sanitizePath(handler)
+	}
+
+	handler = normalizePath(handler)
+
+	handler = denyFragment(handler)
+
+	handler = denyConnect(handler)
+
+	switch configuration.HTTP.AliasHeadersStrategy {
+	case "":
+		// The aliasHeadersStrategy option is not configured, fall back on the deprecated underscoreHeadersStrategy option.
+		switch configuration.HTTP.UnderscoreHeadersStrategy {
+		case "", static.UnderscoreHeadersStrategyKeep:
+			// Headers with underscores are forwarded as is.
+		case static.UnderscoreHeadersStrategyDelete:
+			handler = removeHeadersWithUnderscores(handler)
+		case static.UnderscoreHeadersStrategyReject:
+			handler = rejectHeadersWithUnderscores(handler)
+		default:
+			return nil, fmt.Errorf("invalid underscoreHeadersStrategy value %q", configuration.HTTP.UnderscoreHeadersStrategy)
+		}
+	case static.AliasHeadersStrategyKeep:
+		// Headers whose name aliases another header name are forwarded as is.
+	case static.AliasHeadersStrategyDelete:
+		handler = removeAliasingHeaders(handler)
+	case static.AliasHeadersStrategyReject:
+		handler = rejectAliasingHeaders(handler)
+	default:
+		return nil, fmt.Errorf("invalid aliasHeadersStrategy value %q", configuration.HTTP.AliasHeadersStrategy)
+	}
+
+	// An opaque URL has to be rejected before any handler deriving the path or the request URI from it,
+	// hence the wrapping has to be done last so that it is the first handler executed.
+	handler = denyOpaque(handler)
+
+	handler = populateRequestTLS(handler)
+
+	// The round trippers and connection pools dedicated to a connection (Kerberos or NTLM) are only reachable from its
+	// context, which is kept until the ConnState hook reports the connection closed to release them.
+	var transportConnContexts connContexts
+
+	var connContext multipleConnContext
+	connContext.AddConnContextFunc(func(ctx context.Context, c net.Conn) context.Context {
+		// This adds an empty struct in order to store a RoundTripper in the ConnContext in case of Kerberos or NTLM.
+		ctx = kerberos.AddTransportOnContext(ctx)
+		// Same as above for the FastProxy connection pools, storing a dedicated pool in case of Kerberos or NTLM.
+		ctx = fast.AddConnPoolsOnContext(ctx)
+		transportConnContexts.add(ctx, c)
+
+		if tlsConn, ok := c.(*tls.Conn); ok {
+			ctx = context.WithValue(ctx, tlsConnKey{}, tlsConn)
+
+			if tlsConnWithOptionsName, ok := tlsConn.NetConn().(tcp.TLSConn); ok {
+				return tcp.AddTLSOptionsNameInContext(ctx, tlsConnWithOptionsName.TLSOptionsName)
+			}
+		}
+
+		return ctx
+	})
+
+	if debugConnection || (configuration.Transport != nil && (configuration.Transport.KeepAliveMaxTime > 0 || configuration.Transport.KeepAliveMaxRequests > 0)) {
+		connContext.AddConnContextFunc(func(ctx context.Context, c net.Conn) context.Context {
+			cState := &connState{Start: time.Now()}
+			if debugConnection {
+				clientConnectionStatesMu.Lock()
+				clientConnectionStates[getConnKey(c)] = cState
+				clientConnectionStatesMu.Unlock()
+			}
+
+			return context.WithValue(ctx, connStateKey, cState)
+		})
+	}
+
+	connState := func(c net.Conn, state http.ConnState) {
+		// A hijacked connection never reports the closed state, and serves no further request.
+		if state == http.StateClosed || state == http.StateHijacked {
+			if ctx, ok := transportConnContexts.remove(c); ok {
+				kerberos.ReleaseTransportOnContext(ctx)
+				fast.ReleaseConnPoolsOnContext(ctx)
+			}
+		}
+
+		if debugConnection {
+			clientConnectionStatesMu.Lock()
+			if clientConnectionStates[getConnKey(c)] != nil {
+				clientConnectionStates[getConnKey(c)].State = state.String()
+			}
+			clientConnectionStatesMu.Unlock()
+		}
 	}
 
 	serverHTTP := &http.Server{
-		Handler:      handler,
-		ErrorLog:     httpServerLogger,
-		ReadTimeout:  time.Duration(configuration.Transport.RespondingTimeouts.ReadTimeout),
-		WriteTimeout: time.Duration(configuration.Transport.RespondingTimeouts.WriteTimeout),
-		IdleTimeout:  time.Duration(configuration.Transport.RespondingTimeouts.IdleTimeout),
+		Protocols:           &protocols,
+		Handler:             handler,
+		ErrorLog:            stdlog.New(logs.NoLevel(log.Logger, zerolog.DebugLevel), "", 0),
+		ReadTimeout:         time.Duration(configuration.Transport.RespondingTimeouts.ReadTimeout),
+		WriteTimeout:        time.Duration(configuration.Transport.RespondingTimeouts.WriteTimeout),
+		IdleTimeout:         time.Duration(configuration.Transport.RespondingTimeouts.IdleTimeout),
+		MaxHeaderBytes:      configuration.HTTP.MaxHeaderBytes,
+		MaxHeaderValueCount: configuration.HTTP.MaxHeaderValueCount,
+		HTTP2: &http.HTTP2Config{
+			MaxConcurrentStreams:      int(configuration.HTTP2.MaxConcurrentStreams),
+			MaxDecoderHeaderTableSize: int(configuration.HTTP2.MaxDecoderHeaderTableSize),
+			MaxEncoderHeaderTableSize: int(configuration.HTTP2.MaxEncoderHeaderTableSize),
+		},
+		ConnContext: connContext.Build(),
+		ConnState:   connState,
 	}
 
 	listener := newHTTPForwarder(ln)
 	go func() {
 		err := serverHTTP.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.FromContext(ctx).Errorf("Error while starting server: %v", err)
+			log.Ctx(ctx).Error().Err(err).Msg("Error while running HTTP server")
 		}
 	}()
 	return &httpServer{
@@ -538,6 +815,10 @@ func createHTTPServer(ctx context.Context, ln net.Listener, configuration *stati
 		Forwarder: listener,
 		Switcher:  httpSwitcher,
 	}, nil
+}
+
+func getConnKey(conn net.Conn) string {
+	return fmt.Sprintf("%s => %s", conn.RemoteAddr(), conn.LocalAddr())
 }
 
 func newTrackedConnection(conn tcp.WriteCloser, tracker *connectionTracker) *trackedConnection {
@@ -549,11 +830,293 @@ func newTrackedConnection(conn tcp.WriteCloser, tracker *connectionTracker) *tra
 }
 
 type trackedConnection struct {
-	tracker *connectionTracker
 	tcp.WriteCloser
+
+	tracker *connectionTracker
 }
 
 func (t *trackedConnection) Close() error {
 	t.tracker.RemoveConnection(t.WriteCloser)
 	return t.WriteCloser.Close()
+}
+
+// denyOpaque rejects the request if the URL is opaque.
+// Go only populates URL.Opaque for a request target which is none of the four forms allowed by RFC 9112 section 3.2:
+// origin-form and absolute-form both leave a rest starting with a slash after the scheme,
+// and asterisk-form and authority-form are special-cased.
+// Such a target leaves Path, RawPath and Host empty, hence going unnoticed by the path handling and the routing,
+// while URL.RequestURI gives Opaque precedence over the path, which reinstates the target when forwarding to the backend.
+func denyOpaque(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Opaque != "" {
+			log.Debug().Msgf("Rejecting request because it has an opaque URL: %s", req.URL.Opaque)
+			rw.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+type tlsConnKey struct{}
+
+// populateRequestTLS populates the TLS connection state of the request when it is missing on a TLS connection.
+func populateRequestTLS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.TLS == nil {
+			if tlsConn, ok := req.Context().Value(tlsConnKey{}).(*tls.Conn); ok {
+				state := tlsConn.ConnectionState()
+				req.TLS = &state
+			}
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// denyFragment rejects the request if the URL path contains a fragment (hash character).
+// When go receives an HTTP request, it assumes the absence of fragment URL.
+// However, it is still possible to send a fragment in the request.
+// In this case, Traefik will encode the '#' character, altering the request's intended meaning.
+// To avoid this behavior, the following function rejects requests that include a fragment in the URL.
+func denyFragment(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if strings.Contains(req.URL.RawPath, "#") {
+			log.Debug().Msgf("Rejecting request because it contains a fragment in the URL path: %s", req.URL.RawPath)
+			rw.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// denyConnect rejects the CONNECT requests, whatever the HTTP version.
+// CONNECT tunnels are not supported, and forwarding them without a dedicated handling is unsafe.
+func denyConnect(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodConnect {
+			log.Debug().Msg("Rejecting CONNECT request: CONNECT tunnels are not supported")
+			rw.WriteHeader(http.StatusNotImplemented)
+
+			return
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// isAliasingHeaderName reports whether the given header name contains a character which is neither a letter,
+// a digit, nor a dash, hence making it alias another header name.
+// Go canonicalizes header names on dashes only, whereas the backends deriving variable names from them
+// (CGI, WSGI, PHP, NGINX, ...) read X-Auth-User, X_Auth_User and X.Auth.User as the same HTTP_X_AUTH_USER variable.
+func isAliasingHeaderName(name string) bool {
+	for i := range len(name) {
+		switch c := name[i]; {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9', c == '-':
+			continue
+		default:
+			return true
+		}
+	}
+
+	return false
+}
+
+// removeHeadersWithUnderscores removes any request header whose name contains an underscore character.
+func removeHeadersWithUnderscores(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		for key := range req.Header {
+			if strings.Contains(key, "_") {
+				delete(req.Header, key)
+			}
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// rejectHeadersWithUnderscores rejects with a 400 Bad Request any request carrying a header whose name contains an underscore character.
+func rejectHeadersWithUnderscores(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		for key := range req.Header {
+			if strings.Contains(key, "_") {
+				http.Error(rw, "Bad Request", http.StatusBadRequest)
+				return
+			}
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// removeAliasingHeaders removes any request header whose name contains a character
+// which is neither a letter, a digit, nor a dash, as such a name aliases another header name.
+func removeAliasingHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		for key := range req.Header {
+			if isAliasingHeaderName(key) {
+				delete(req.Header, key)
+			}
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// rejectAliasingHeaders rejects with a 400 Bad Request any request carrying a header whose name
+// contains a character which is neither a letter, a digit, nor a dash, as such a name aliases another header name.
+func rejectAliasingHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		for key := range req.Header {
+			if isAliasingHeaderName(key) {
+				http.Error(rw, "Bad Request", http.StatusBadRequest)
+				return
+			}
+		}
+
+		h.ServeHTTP(rw, req)
+	})
+}
+
+// This function is inspired by http.AllowQuerySemicolons.
+func encodeQuerySemicolons(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if strings.Contains(req.URL.RawQuery, ";") {
+			r2 := new(http.Request)
+			*r2 = *req
+			r2.URL = new(url.URL)
+			*r2.URL = *req.URL
+
+			r2.URL.RawQuery = strings.ReplaceAll(req.URL.RawQuery, ";", "%3B")
+			// Because the reverse proxy director is building query params from requestURI it needs to be updated as well.
+			r2.RequestURI = r2.URL.RequestURI()
+
+			h.ServeHTTP(rw, r2)
+		} else {
+			h.ServeHTTP(rw, req)
+		}
+	})
+}
+
+// sanitizePath removes the "..", "." and duplicate slash segments from the URL according to https://datatracker.ietf.org/doc/html/rfc3986#section-6.2.2.3.
+// The path parameters of the "..;", ".;" and ";" segments are removed first, as backends stripping path parameters (Servlet containers, Spring, ...) resolve them as dot-segments or duplicate slashes.
+// It cleans the request URL Path and RawPath, and updates the request URI.
+func sanitizePath(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		r2 := new(http.Request)
+		*r2 = *req
+
+		// Removes the path parameters of the dot-segments and empty segments, so that JoinPath collapses them.
+		if escapedPath := req.URL.EscapedPath(); strings.Contains(escapedPath, ";") {
+			segments := strings.Split(escapedPath, "/")
+			for i, segment := range segments {
+				switch {
+				case strings.HasPrefix(segment, "..;"):
+					segments[i] = ".."
+				case strings.HasPrefix(segment, ".;"):
+					segments[i] = "."
+				case strings.HasPrefix(segment, ";"):
+					segments[i] = ""
+				}
+			}
+
+			r2.URL = new(url.URL)
+			*r2.URL = *req.URL
+			r2.URL.RawPath = strings.Join(segments, "/")
+			r2.URL.Path, _ = url.PathUnescape(r2.URL.RawPath)
+		}
+
+		// Cleans the URL raw path and path.
+		r2.URL = r2.URL.JoinPath()
+
+		// Because the reverse proxy director is building query params from requestURI it needs to be updated as well.
+		r2.RequestURI = r2.URL.RequestURI()
+
+		h.ServeHTTP(rw, r2)
+	})
+}
+
+// unreservedCharacters contains the mapping of the percent-encoded form to the ASCII form
+// of the unreserved characters according to https://datatracker.ietf.org/doc/html/rfc3986#section-2.3.
+var unreservedCharacters = map[string]rune{
+	"%41": 'A', "%42": 'B', "%43": 'C', "%44": 'D', "%45": 'E', "%46": 'F',
+	"%47": 'G', "%48": 'H', "%49": 'I', "%4A": 'J', "%4B": 'K', "%4C": 'L',
+	"%4D": 'M', "%4E": 'N', "%4F": 'O', "%50": 'P', "%51": 'Q', "%52": 'R',
+	"%53": 'S', "%54": 'T', "%55": 'U', "%56": 'V', "%57": 'W', "%58": 'X',
+	"%59": 'Y', "%5A": 'Z',
+
+	"%61": 'a', "%62": 'b', "%63": 'c', "%64": 'd', "%65": 'e', "%66": 'f',
+	"%67": 'g', "%68": 'h', "%69": 'i', "%6A": 'j', "%6B": 'k', "%6C": 'l',
+	"%6D": 'm', "%6E": 'n', "%6F": 'o', "%70": 'p', "%71": 'q', "%72": 'r',
+	"%73": 's', "%74": 't', "%75": 'u', "%76": 'v', "%77": 'w', "%78": 'x',
+	"%79": 'y', "%7A": 'z',
+
+	"%30": '0', "%31": '1', "%32": '2', "%33": '3', "%34": '4',
+	"%35": '5', "%36": '6', "%37": '7', "%38": '8', "%39": '9',
+
+	"%2D": '-', "%2E": '.', "%5F": '_', "%7E": '~',
+}
+
+// normalizePath removes from the RawPath unreserved percent-encoded characters as they are equivalent to their non-encoded
+// form according to https://datatracker.ietf.org/doc/html/rfc3986#section-2.3 and capitalizes percent-encoded characters
+// according to https://datatracker.ietf.org/doc/html/rfc3986#section-6.2.2.1.
+func normalizePath(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rawPath := req.URL.RawPath
+
+		// When the RawPath is empty the encoded form of the Path is equivalent to the original request Path.
+		// Thus, the normalization is not needed as no unreserved characters were encoded and the encoded version
+		// of Path obtained with URL.EscapedPath contains only percent-encoded characters in upper case.
+		if rawPath == "" {
+			h.ServeHTTP(rw, req)
+			return
+		}
+
+		var normalizedRawPathBuilder strings.Builder
+		for i := 0; i < len(rawPath); i++ {
+			if rawPath[i] != '%' {
+				normalizedRawPathBuilder.WriteString(string(rawPath[i]))
+				continue
+			}
+
+			// This should never happen as the standard library will reject requests containing invalid percent-encodings.
+			// This discards URLs with a percent character at the end.
+			if i+2 >= len(rawPath) {
+				rw.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			encodedCharacter := strings.ToUpper(rawPath[i : i+3])
+			if r, unreserved := unreservedCharacters[encodedCharacter]; unreserved {
+				normalizedRawPathBuilder.WriteRune(r)
+			} else {
+				normalizedRawPathBuilder.WriteString(encodedCharacter)
+			}
+
+			i += 2
+		}
+
+		normalizedRawPath := normalizedRawPathBuilder.String()
+
+		// We do not have to alter the request URL as the original RawPath is already normalized.
+		if normalizedRawPath == rawPath {
+			h.ServeHTTP(rw, req)
+			return
+		}
+
+		r2 := new(http.Request)
+		*r2 = *req
+
+		// Decoding unreserved characters only alter the RAW version of the URL,
+		// as unreserved percent-encoded characters are equivalent to their non encoded form.
+		r2.URL.RawPath = normalizedRawPath
+
+		// Because the reverse proxy director is building query params from RequestURI it needs to be updated as well.
+		r2.RequestURI = r2.URL.RequestURI()
+
+		h.ServeHTTP(rw, r2)
+	})
 }

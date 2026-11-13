@@ -4,19 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
 )
 
 type tcpRouterRepresentation struct {
 	*runtime.TCPRouterInfo
-	Name     string `json:"name,omitempty"`
-	Provider string `json:"provider,omitempty"`
+
+	Name        string `json:"name,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	PriorityStr string `json:"priorityStr,omitempty"`
 }
 
 func newTCPRouterRepresentation(name string, rt *runtime.TCPRouterInfo) tcpRouterRepresentation {
@@ -24,14 +26,17 @@ func newTCPRouterRepresentation(name string, rt *runtime.TCPRouterInfo) tcpRoute
 		TCPRouterInfo: rt,
 		Name:          name,
 		Provider:      getProviderName(name),
+		PriorityStr:   strconv.FormatInt(int64(rt.Priority), 10),
 	}
 }
 
 type tcpServiceRepresentation struct {
 	*runtime.TCPServiceInfo
-	Name     string `json:"name,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Type     string `json:"type,omitempty"`
+
+	Name         string            `json:"name,omitempty"`
+	Provider     string            `json:"provider,omitempty"`
+	Type         string            `json:"type,omitempty"`
+	ServerStatus map[string]string `json:"serverStatus,omitempty"`
 }
 
 func newTCPServiceRepresentation(name string, si *runtime.TCPServiceInfo) tcpServiceRepresentation {
@@ -40,11 +45,13 @@ func newTCPServiceRepresentation(name string, si *runtime.TCPServiceInfo) tcpSer
 		Name:           name,
 		Provider:       getProviderName(name),
 		Type:           strings.ToLower(extractType(si.TCPService)),
+		ServerStatus:   si.GetAllStatus(),
 	}
 }
 
 type tcpMiddlewareRepresentation struct {
 	*runtime.TCPMiddlewareInfo
+
 	Name     string `json:"name,omitempty"`
 	Provider string `json:"provider,omitempty"`
 	Type     string `json:"type,omitempty"`
@@ -59,10 +66,11 @@ func newTCPMiddlewareRepresentation(name string, mi *runtime.TCPMiddlewareInfo) 
 	}
 }
 
-func (h Handler) getTCPRouters(rw http.ResponseWriter, request *http.Request) {
+func (h *Handler) getTCPRouters(rw http.ResponseWriter, request *http.Request) {
 	results := make([]tcpRouterRepresentation, 0, len(h.runtimeConfiguration.TCPRouters))
 
-	criterion := newSearchCriterion(request.URL.Query())
+	query := request.URL.Query()
+	criterion := newSearchCriterion(query)
 
 	for name, rt := range h.runtimeConfiguration.TCPRouters {
 		if keepTCPRouter(name, rt, criterion) {
@@ -70,9 +78,7 @@ func (h Handler) getTCPRouters(rw http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Name < results[j].Name
-	})
+	sortRouters(query, results)
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -86,13 +92,19 @@ func (h Handler) getTCPRouters(rw http.ResponseWriter, request *http.Request) {
 
 	err = json.NewEncoder(rw).Encode(results[pageInfo.startIndex:pageInfo.endIndex])
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getTCPRouter(rw http.ResponseWriter, request *http.Request) {
-	routerID := mux.Vars(request)["routerID"]
+func (h *Handler) getTCPRouter(rw http.ResponseWriter, request *http.Request) {
+	scapedRouterID := mux.Vars(request)["routerID"]
+
+	routerID, err := url.PathUnescape(scapedRouterID)
+	if err != nil {
+		writeError(rw, fmt.Sprintf("unable to decode routerID %q: %s", scapedRouterID, err), http.StatusBadRequest)
+		return
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -104,17 +116,18 @@ func (h Handler) getTCPRouter(rw http.ResponseWriter, request *http.Request) {
 
 	result := newTCPRouterRepresentation(routerID, router)
 
-	err := json.NewEncoder(rw).Encode(result)
+	err = json.NewEncoder(rw).Encode(result)
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getTCPServices(rw http.ResponseWriter, request *http.Request) {
+func (h *Handler) getTCPServices(rw http.ResponseWriter, request *http.Request) {
 	results := make([]tcpServiceRepresentation, 0, len(h.runtimeConfiguration.TCPServices))
 
-	criterion := newSearchCriterion(request.URL.Query())
+	query := request.URL.Query()
+	criterion := newSearchCriterion(query)
 
 	for name, si := range h.runtimeConfiguration.TCPServices {
 		if keepTCPService(name, si, criterion) {
@@ -122,9 +135,7 @@ func (h Handler) getTCPServices(rw http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Name < results[j].Name
-	})
+	sortServices(query, results)
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -138,13 +149,19 @@ func (h Handler) getTCPServices(rw http.ResponseWriter, request *http.Request) {
 
 	err = json.NewEncoder(rw).Encode(results[pageInfo.startIndex:pageInfo.endIndex])
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getTCPService(rw http.ResponseWriter, request *http.Request) {
-	serviceID := mux.Vars(request)["serviceID"]
+func (h *Handler) getTCPService(rw http.ResponseWriter, request *http.Request) {
+	scapedServiceID := mux.Vars(request)["serviceID"]
+
+	serviceID, err := url.PathUnescape(scapedServiceID)
+	if err != nil {
+		writeError(rw, fmt.Sprintf("unable to decode serviceID %q: %s", scapedServiceID, err), http.StatusBadRequest)
+		return
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -156,17 +173,18 @@ func (h Handler) getTCPService(rw http.ResponseWriter, request *http.Request) {
 
 	result := newTCPServiceRepresentation(serviceID, service)
 
-	err := json.NewEncoder(rw).Encode(result)
+	err = json.NewEncoder(rw).Encode(result)
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getTCPMiddlewares(rw http.ResponseWriter, request *http.Request) {
+func (h *Handler) getTCPMiddlewares(rw http.ResponseWriter, request *http.Request) {
 	results := make([]tcpMiddlewareRepresentation, 0, len(h.runtimeConfiguration.Middlewares))
 
-	criterion := newSearchCriterion(request.URL.Query())
+	query := request.URL.Query()
+	criterion := newSearchCriterion(query)
 
 	for name, mi := range h.runtimeConfiguration.TCPMiddlewares {
 		if keepTCPMiddleware(name, mi, criterion) {
@@ -174,9 +192,7 @@ func (h Handler) getTCPMiddlewares(rw http.ResponseWriter, request *http.Request
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Name < results[j].Name
-	})
+	sortMiddlewares(query, results)
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -190,13 +206,19 @@ func (h Handler) getTCPMiddlewares(rw http.ResponseWriter, request *http.Request
 
 	err = json.NewEncoder(rw).Encode(results[pageInfo.startIndex:pageInfo.endIndex])
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func (h Handler) getTCPMiddleware(rw http.ResponseWriter, request *http.Request) {
-	middlewareID := mux.Vars(request)["middlewareID"]
+func (h *Handler) getTCPMiddleware(rw http.ResponseWriter, request *http.Request) {
+	scapedMiddlewareID := mux.Vars(request)["middlewareID"]
+
+	middlewareID, err := url.PathUnescape(scapedMiddlewareID)
+	if err != nil {
+		writeError(rw, fmt.Sprintf("unable to decode middlewareID %q: %s", scapedMiddlewareID, err), http.StatusBadRequest)
+		return
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 
@@ -208,9 +230,9 @@ func (h Handler) getTCPMiddleware(rw http.ResponseWriter, request *http.Request)
 
 	result := newTCPMiddlewareRepresentation(middlewareID, middleware)
 
-	err := json.NewEncoder(rw).Encode(result)
+	err = json.NewEncoder(rw).Encode(result)
 	if err != nil {
-		log.FromContext(request.Context()).Error(err)
+		log.Ctx(request.Context()).Error().Err(err).Send()
 		writeError(rw, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -220,7 +242,10 @@ func keepTCPRouter(name string, item *runtime.TCPRouterInfo, criterion *searchCr
 		return true
 	}
 
-	return criterion.withStatus(item.Status) && criterion.searchIn(item.Rule, name)
+	return criterion.withStatus(item.Status) &&
+		criterion.searchIn(item.Rule, name) &&
+		criterion.filterService(item.Service) &&
+		criterion.filterMiddleware(item.Middlewares)
 }
 
 func keepTCPService(name string, item *runtime.TCPServiceInfo, criterion *searchCriterion) bool {

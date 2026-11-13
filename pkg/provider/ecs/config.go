@@ -1,20 +1,23 @@
 package ecs
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"slices"
 	"strconv"
-	"strings"
 
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/docker/go-connections/nat"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/label"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/provider"
-	"github.com/traefik/traefik/v2/pkg/provider/constraints"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	networktypes "github.com/moby/moby/api/types/network"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/label"
+	"github.com/traefik/traefik/v3/pkg/provider"
+	"github.com/traefik/traefik/v3/pkg/provider/constraints"
 )
 
 func (p *Provider) buildConfiguration(ctx context.Context, instances []ecsInstance) *dynamic.Configuration {
@@ -22,17 +25,16 @@ func (p *Provider) buildConfiguration(ctx context.Context, instances []ecsInstan
 
 	for _, instance := range instances {
 		instanceName := getServiceName(instance) + "-" + instance.ID
-		ctxContainer := log.With(ctx, log.Str("ecs-instance", instanceName))
+		logger := log.Ctx(ctx).With().Str("ecs-instance", instanceName).Logger()
+		ctxContainer := logger.WithContext(ctx)
 
 		if !p.filterInstance(ctxContainer, instance) {
 			continue
 		}
 
-		logger := log.FromContext(ctxContainer)
-
 		confFromLabel, err := label.DecodeConfiguration(instance.Labels)
 		if err != nil {
-			logger.Error(err)
+			logger.Error().Err(err).Send()
 			continue
 		}
 
@@ -42,7 +44,7 @@ func (p *Provider) buildConfiguration(ctx context.Context, instances []ecsInstan
 
 			err := p.buildTCPServiceConfiguration(instance, confFromLabel.TCP)
 			if err != nil {
-				logger.Error(err)
+				logger.Error().Err(err).Send()
 				continue
 			}
 			provider.BuildTCPRouterConfiguration(ctxContainer, confFromLabel.TCP)
@@ -53,7 +55,7 @@ func (p *Provider) buildConfiguration(ctx context.Context, instances []ecsInstan
 
 			err := p.buildUDPServiceConfiguration(instance, confFromLabel.UDP)
 			if err != nil {
-				logger.Error(err)
+				logger.Error().Err(err).Send()
 				continue
 			}
 			provider.BuildUDPRouterConfiguration(ctxContainer, confFromLabel.UDP)
@@ -68,7 +70,7 @@ func (p *Provider) buildConfiguration(ctx context.Context, instances []ecsInstan
 
 		err = p.buildServiceConfiguration(ctxContainer, instance, confFromLabel.HTTP)
 		if err != nil {
-			logger.Error(err)
+			logger.Error().Err(err).Send()
 			continue
 		}
 
@@ -87,18 +89,17 @@ func (p *Provider) buildConfiguration(ctx context.Context, instances []ecsInstan
 		configurations[instanceName] = confFromLabel
 	}
 
-	return provider.Merge(ctx, configurations)
+	return provider.Merge(ctx, provider.NameSortedConfigurations(configurations), provider.ResourceStrategyMerge)
 }
 
 func (p *Provider) buildTCPServiceConfiguration(instance ecsInstance, configuration *dynamic.TCPConfiguration) error {
 	serviceName := getServiceName(instance)
 
 	if len(configuration.Services) == 0 {
-		configuration.Services = make(map[string]*dynamic.TCPService)
-		lb := &dynamic.TCPServersLoadBalancer{}
-		lb.SetDefaults()
-		configuration.Services[serviceName] = &dynamic.TCPService{
-			LoadBalancer: lb,
+		configuration.Services = map[string]*dynamic.TCPService{
+			serviceName: {
+				LoadBalancer: new(dynamic.TCPServersLoadBalancer),
+			},
 		}
 	}
 
@@ -156,40 +157,40 @@ func (p *Provider) buildServiceConfiguration(_ context.Context, instance ecsInst
 }
 
 func (p *Provider) filterInstance(ctx context.Context, instance ecsInstance) bool {
-	logger := log.FromContext(ctx)
+	logger := log.Ctx(ctx)
 
 	if instance.machine == nil {
-		logger.Debug("Filtering ecs instance with nil machine")
+		logger.Debug().Msg("Filtering ecs instance with nil machine")
 		return false
 	}
 
-	if strings.ToLower(instance.machine.state) != ec2.InstanceStateNameRunning {
-		logger.Debugf("Filtering ecs instance with an incorrect state %s (%s) (state = %s)", instance.Name, instance.ID, instance.machine.state)
+	if instance.machine.state != ec2types.InstanceStateNameRunning {
+		logger.Debug().Msgf("Filtering ecs instance with an incorrect state %s (%s) (state = %s)", instance.Name, instance.ID, instance.machine.state)
 		return false
 	}
 
-	if instance.machine.healthStatus == "UNHEALTHY" {
-		logger.Debugf("Filtering unhealthy ecs instance %s (%s)", instance.Name, instance.ID)
+	if instance.machine.healthStatus == ecstypes.HealthStatusUnhealthy {
+		logger.Debug().Msgf("Filtering unhealthy ecs instance %s (%s)", instance.Name, instance.ID)
 		return false
 	}
 
 	if len(instance.machine.privateIP) == 0 {
-		logger.Debugf("Filtering ecs instance without an ip address %s (%s)", instance.Name, instance.ID)
+		logger.Debug().Msgf("Filtering ecs instance without an ip address %s (%s)", instance.Name, instance.ID)
 		return false
 	}
 
 	if !instance.ExtraConf.Enable {
-		logger.Debugf("Filtering disabled ecs instance %s (%s)", instance.Name, instance.ID)
+		logger.Debug().Msgf("Filtering disabled ecs instance %s (%s)", instance.Name, instance.ID)
 		return false
 	}
 
 	matches, err := constraints.MatchLabels(instance.Labels, p.Constraints)
 	if err != nil {
-		logger.Errorf("Error matching constraints expression: %v", err)
+		logger.Error().Err(err).Msg("Error matching constraint expression")
 		return false
 	}
 	if !matches {
-		logger.Debugf("Container pruned by constraint expression: %q", p.Constraints)
+		logger.Debug().Msgf("Container pruned by constraint expression: %q", p.Constraints)
 		return false
 	}
 
@@ -201,21 +202,16 @@ func (p *Provider) addServerTCP(instance ecsInstance, loadBalancer *dynamic.TCPS
 		return errors.New("load-balancer is not defined")
 	}
 
-	var serverPort string
-	if len(loadBalancer.Servers) > 0 {
-		serverPort = loadBalancer.Servers[0].Port
-		loadBalancer.Servers[0].Port = ""
+	if len(loadBalancer.Servers) == 0 {
+		loadBalancer.Servers = []dynamic.TCPServer{{}}
 	}
+
+	serverPort := loadBalancer.Servers[0].Port
+	loadBalancer.Servers[0].Port = ""
 
 	ip, port, err := p.getIPPort(instance, serverPort)
 	if err != nil {
 		return err
-	}
-
-	if len(loadBalancer.Servers) == 0 {
-		server := dynamic.TCPServer{}
-
-		loadBalancer.Servers = []dynamic.TCPServer{server}
 	}
 
 	if port == "" {
@@ -223,6 +219,7 @@ func (p *Provider) addServerTCP(instance ecsInstance, loadBalancer *dynamic.TCPS
 	}
 
 	loadBalancer.Servers[0].Address = net.JoinHostPort(ip, port)
+
 	return nil
 }
 
@@ -231,21 +228,16 @@ func (p *Provider) addServerUDP(instance ecsInstance, loadBalancer *dynamic.UDPS
 		return errors.New("load-balancer is not defined")
 	}
 
-	var serverPort string
-	if len(loadBalancer.Servers) > 0 {
-		serverPort = loadBalancer.Servers[0].Port
-		loadBalancer.Servers[0].Port = ""
+	if len(loadBalancer.Servers) == 0 {
+		loadBalancer.Servers = []dynamic.UDPServer{{}}
 	}
+
+	serverPort := loadBalancer.Servers[0].Port
+	loadBalancer.Servers[0].Port = ""
 
 	ip, port, err := p.getIPPort(instance, serverPort)
 	if err != nil {
 		return err
-	}
-
-	if len(loadBalancer.Servers) == 0 {
-		server := dynamic.UDPServer{}
-
-		loadBalancer.Servers = []dynamic.UDPServer{server}
 	}
 
 	if port == "" {
@@ -253,6 +245,7 @@ func (p *Provider) addServerUDP(instance ecsInstance, loadBalancer *dynamic.UDPS
 	}
 
 	loadBalancer.Servers[0].Address = net.JoinHostPort(ip, port)
+
 	return nil
 }
 
@@ -261,30 +254,36 @@ func (p *Provider) addServer(instance ecsInstance, loadBalancer *dynamic.Servers
 		return errors.New("load-balancer is not defined")
 	}
 
-	var serverPort string
-	if len(loadBalancer.Servers) > 0 {
-		serverPort = loadBalancer.Servers[0].Port
-		loadBalancer.Servers[0].Port = ""
+	if len(loadBalancer.Servers) == 0 {
+		loadBalancer.Servers = []dynamic.Server{{}}
 	}
+
+	if loadBalancer.Servers[0].URL != "" {
+		if loadBalancer.Servers[0].Scheme != "" || loadBalancer.Servers[0].Port != "" {
+			return errors.New("defining scheme or port is not allowed when URL is defined")
+		}
+		return nil
+	}
+
+	serverPort := loadBalancer.Servers[0].Port
+	loadBalancer.Servers[0].Port = ""
 
 	ip, port, err := p.getIPPort(instance, serverPort)
 	if err != nil {
 		return err
 	}
 
-	if len(loadBalancer.Servers) == 0 {
-		server := dynamic.Server{}
-		server.SetDefaults()
-
-		loadBalancer.Servers = []dynamic.Server{server}
-	}
-
 	if port == "" {
 		return errors.New("port is missing")
 	}
 
-	loadBalancer.Servers[0].URL = fmt.Sprintf("%s://%s", loadBalancer.Servers[0].Scheme, net.JoinHostPort(ip, port))
+	scheme := loadBalancer.Servers[0].Scheme
 	loadBalancer.Servers[0].Scheme = ""
+	if scheme == "" {
+		scheme = "http"
+	}
+
+	loadBalancer.Servers[0].URL = fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(ip, port))
 
 	return nil
 }
@@ -292,7 +291,7 @@ func (p *Provider) addServer(instance ecsInstance, loadBalancer *dynamic.Servers
 func (p *Provider) getIPPort(instance ecsInstance, serverPort string) (string, string, error) {
 	var ip, port string
 
-	ip = p.getIPAddress(instance)
+	ip = instance.machine.privateIP
 	port = getPort(instance, serverPort)
 	if len(ip) == 0 {
 		return "", "", fmt.Errorf("unable to find the IP address for the instance %q: the server is ignored", instance.Name)
@@ -301,43 +300,43 @@ func (p *Provider) getIPPort(instance ecsInstance, serverPort string) (string, s
 	return ip, port, nil
 }
 
-func (p Provider) getIPAddress(instance ecsInstance) string {
-	return instance.machine.privateIP
-}
-
 func getPort(instance ecsInstance, serverPort string) string {
 	if len(serverPort) > 0 {
 		for _, port := range instance.machine.ports {
-			containerPort := strconv.FormatInt(port.containerPort, 10)
+			containerPort := strconv.FormatInt(int64(port.containerPort), 10)
 			if serverPort == containerPort {
-				return strconv.FormatInt(port.hostPort, 10)
+				return strconv.FormatInt(int64(port.hostPort), 10)
 			}
 		}
 
 		return serverPort
 	}
 
-	var ports []nat.Port
+	var ports []networktypes.Port
 	for _, port := range instance.machine.ports {
-		natPort, err := nat.NewPort(port.protocol, strconv.FormatInt(port.hostPort, 10))
-		if err != nil {
+		if port.hostPort < 0 || port.hostPort > math.MaxUint16 {
+			// port out of range
 			continue
 		}
-
+		if port.protocol == "" {
+			port.protocol = ecstypes.TransportProtocolTcp
+		}
+		natPort, ok := networktypes.PortFrom(uint16(port.hostPort), networktypes.IPProtocol(port.protocol))
+		if !ok {
+			continue
+		}
 		ports = append(ports, natPort)
 	}
 
-	less := func(i, j nat.Port) bool {
-		return i.Int() < j.Int()
-	}
-	nat.Sort(ports, less)
-
-	if len(ports) > 0 {
-		min := ports[0]
-		return min.Port()
+	if len(ports) == 0 {
+		return ""
 	}
 
-	return ""
+	slices.SortFunc(ports, func(a, b networktypes.Port) int {
+		return cmp.Compare(a.Num(), b.Num())
+	})
+
+	return ports[0].Port()
 }
 
 func getServiceName(instance ecsInstance) string {

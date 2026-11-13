@@ -1,19 +1,19 @@
 package http
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	ptypes "github.com/traefik/paerser/types"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/safe"
-	"github.com/traefik/traefik/v2/pkg/tls"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/safe"
+	"github.com/traefik/traefik/v3/pkg/tls"
 )
 
 func TestProvider_Init(t *testing.T) {
@@ -65,53 +65,98 @@ func TestProvider_SetDefaults(t *testing.T) {
 
 	assert.Equal(t, provider.PollInterval, ptypes.Duration(5*time.Second))
 	assert.Equal(t, provider.PollTimeout, ptypes.Duration(5*time.Second))
+	assert.Equal(t, int64(-1), provider.MaxResponseBodySize)
 }
 
 func TestProvider_fetchConfigurationData(t *testing.T) {
 	tests := []struct {
-		desc    string
-		handler func(rw http.ResponseWriter, req *http.Request)
-		expData []byte
-		expErr  bool
+		desc                string
+		statusCode          int
+		headers             map[string]string
+		expData             []byte
+		expErr              require.ErrorAssertionFunc
+		maxResponseBodySize *int64
 	}{
 		{
-			desc:    "should return the fetched configuration data",
-			expData: []byte("{}"),
-			handler: func(rw http.ResponseWriter, req *http.Request) {
-				rw.WriteHeader(http.StatusOK)
-				_, _ = fmt.Fprintf(rw, "{}")
-			},
+			desc:       "should return the fetched configuration data",
+			statusCode: http.StatusOK,
+			expData:    []byte("{}"),
+			expErr:     require.NoError,
 		},
 		{
-			desc:   "should return an error if endpoint does not return an OK status code",
-			expErr: true,
-			handler: func(rw http.ResponseWriter, req *http.Request) {
-				rw.WriteHeader(http.StatusNoContent)
+			desc:       "should send configured headers",
+			statusCode: http.StatusOK,
+			headers: map[string]string{
+				"Foo":  "bar",
+				"Bar":  "baz",
+				"Host": "localhost",
 			},
+			expData: []byte("{}"),
+			expErr:  require.NoError,
+		},
+		{
+			desc:       "should return an error if endpoint does not return an OK status code",
+			statusCode: http.StatusInternalServerError,
+			expErr:     require.Error,
+		},
+		{
+			desc:                "should return an error response body is too long when maxResponseBodySize is 0",
+			statusCode:          http.StatusOK,
+			maxResponseBodySize: new(int64(0)),
+			expErr:              require.Error,
+		},
+		{
+			desc:                "should return an error response body is too long when response is longer than maxResponseBodySize",
+			statusCode:          http.StatusOK,
+			maxResponseBodySize: new(int64(1)),
+			expErr:              require.Error,
+		},
+		{
+			desc:                "should return the fetched configuration data when response is the same length with maxResponseBodySize",
+			statusCode:          http.StatusOK,
+			maxResponseBodySize: new(int64(2)),
+			expData:             []byte("{}"),
+			expErr:              require.NoError,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(test.handler))
-			defer server.Close()
+			handlerCalled := false
+			srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				handlerCalled = true
 
-			provider := Provider{
-				Endpoint:     server.URL,
-				PollInterval: ptypes.Duration(1 * time.Second),
-				PollTimeout:  ptypes.Duration(1 * time.Second),
+				for k, v := range test.headers {
+					if strings.EqualFold(k, "Host") {
+						assert.Equal(t, v, req.Host)
+					} else {
+						assert.Equal(t, v, req.Header.Get(k))
+					}
+				}
+
+				rw.WriteHeader(test.statusCode)
+				_, _ = rw.Write([]byte("{}"))
+			}))
+			defer srv.Close()
+
+			var provider Provider
+			provider.SetDefaults()
+
+			provider.Headers = test.headers
+			provider.Endpoint = srv.URL
+			provider.PollTimeout = ptypes.Duration(1 * time.Second)
+			provider.PollInterval = ptypes.Duration(1 * time.Second)
+			if test.maxResponseBodySize != nil {
+				provider.MaxResponseBodySize = *test.maxResponseBodySize
 			}
 
 			err := provider.Init()
 			require.NoError(t, err)
 
 			configData, err := provider.fetchConfigurationData()
-			if test.expErr {
-				require.Error(t, err)
-				return
-			}
+			test.expErr(t, err)
 
-			require.NoError(t, err)
+			assert.True(t, handlerCalled)
 			assert.Equal(t, test.expData, configData)
 		})
 	}
@@ -131,7 +176,7 @@ func TestProvider_decodeConfiguration(t *testing.T) {
 		},
 		{
 			desc:       "should return the decoded dynamic configuration",
-			configData: []byte("{\"tcp\":{\"routers\":{\"foo\":{}}}}"),
+			configData: []byte(`{"tcp":{"routers":{"foo":{}}}}`),
 			expConfig: &dynamic.Configuration{
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers:           make(map[string]*dynamic.Router),
@@ -143,7 +188,8 @@ func TestProvider_decodeConfiguration(t *testing.T) {
 					Routers: map[string]*dynamic.TCPRouter{
 						"foo": {},
 					},
-					Services: make(map[string]*dynamic.TCPService),
+					Services:          make(map[string]*dynamic.TCPService),
+					ServersTransports: map[string]*dynamic.TCPServersTransport{},
 				},
 				TLS: &dynamic.TLSConfiguration{
 					Stores:  make(map[string]tls.Store),
@@ -180,11 +226,12 @@ func TestProvider_Provide(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(handler))
 	defer server.Close()
 
-	provider := Provider{
-		Endpoint:     server.URL,
-		PollTimeout:  ptypes.Duration(1 * time.Second),
-		PollInterval: ptypes.Duration(100 * time.Millisecond),
-	}
+	var provider Provider
+	provider.SetDefaults()
+
+	provider.Endpoint = server.URL
+	provider.PollTimeout = ptypes.Duration(1 * time.Second)
+	provider.PollInterval = ptypes.Duration(100 * time.Millisecond)
 
 	err := provider.Init()
 	require.NoError(t, err)
@@ -199,8 +246,9 @@ func TestProvider_Provide(t *testing.T) {
 			ServersTransports: make(map[string]*dynamic.ServersTransport),
 		},
 		TCP: &dynamic.TCPConfiguration{
-			Routers:  make(map[string]*dynamic.TCPRouter),
-			Services: make(map[string]*dynamic.TCPService),
+			Routers:           make(map[string]*dynamic.TCPRouter),
+			Services:          make(map[string]*dynamic.TCPService),
+			ServersTransports: map[string]*dynamic.TCPServersTransport{},
 		},
 		TLS: &dynamic.TLSConfiguration{
 			Stores:  make(map[string]tls.Store),
@@ -212,7 +260,7 @@ func TestProvider_Provide(t *testing.T) {
 		},
 	}
 
-	err = provider.Provide(configurationChan, safe.NewPool(context.Background()))
+	err = provider.Provide(configurationChan, safe.NewPool(t.Context()))
 	require.NoError(t, err)
 
 	timeout := time.After(time.Second)
@@ -235,21 +283,22 @@ func TestProvider_ProvideConfigurationOnlyOnceIfUnchanged(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(handler))
 	defer server.Close()
 
-	provider := Provider{
-		Endpoint:     server.URL + "/endpoint",
-		PollTimeout:  ptypes.Duration(1 * time.Second),
-		PollInterval: ptypes.Duration(100 * time.Millisecond),
-	}
+	var provider Provider
+	provider.SetDefaults()
+
+	provider.Endpoint = server.URL + "/endpoint"
+	provider.PollTimeout = ptypes.Duration(1 * time.Second)
+	provider.PollInterval = ptypes.Duration(100 * time.Millisecond)
 
 	err := provider.Init()
 	require.NoError(t, err)
 
 	configurationChan := make(chan dynamic.Message, 10)
 
-	err = provider.Provide(configurationChan, safe.NewPool(context.Background()))
+	err = provider.Provide(configurationChan, safe.NewPool(t.Context()))
 	require.NoError(t, err)
 
 	time.Sleep(time.Second)
 
-	assert.Equal(t, 1, len(configurationChan))
+	assert.Len(t, configurationChan, 1)
 }

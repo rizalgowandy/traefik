@@ -4,62 +4,64 @@ import (
 	"container/heap"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"sync"
 
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/server/service/loadbalancer"
 )
+
+var errNoAvailableServer = errors.New("no available server")
 
 type namedHandler struct {
 	http.Handler
+
 	name     string
 	weight   float64
 	deadline float64
-}
-
-type stickyCookie struct {
-	name     string
-	secure   bool
-	httpOnly bool
 }
 
 // Balancer is a WeightedRoundRobin load balancer based on Earliest Deadline First (EDF).
 // (https://en.wikipedia.org/wiki/Earliest_deadline_first_scheduling)
 // Each pick from the schedule has the earliest deadline entry selected.
 // Entries have deadlines set at currentDeadline + 1 / weight,
-// providing weighted round robin behavior with floating point weights and an O(log n) pick time.
+// providing weighted round-robin behavior with floating point weights and an O(log n) pick time.
 type Balancer struct {
-	stickyCookie     *stickyCookie
 	wantsHealthCheck bool
 
-	mutex       sync.RWMutex
-	handlers    []*namedHandler
-	curDeadline float64
+	// handlersMu is a mutex to protect the handlers slice, the status and the fenced maps.
+	handlersMu sync.RWMutex
+	handlers   []*namedHandler
 	// status is a record of which child services of the Balancer are healthy, keyed
 	// by name of child service. A service is initially added to the map when it is
-	// created via AddService, and it is later removed or added to the map as needed,
+	// created via Add, and it is later removed or added to the map as needed,
 	// through the SetStatus method.
 	status map[string]struct{}
+	// fenced is the list of terminating yet still serving child services.
+	fenced map[string]struct{}
+
 	// updaters is the list of hooks that are run (to update the Balancer
 	// parent(s)), whenever the Balancer status changes.
+	// No mutex is needed, as it is modified only during the configuration build.
 	updaters []func(bool)
+
+	sticky *loadbalancer.Sticky
+
+	curDeadline float64
 }
 
 // New creates a new load balancer.
-func New(sticky *dynamic.Sticky, hc *dynamic.HealthCheck) *Balancer {
+func New(sticky *dynamic.Sticky, wantsHealthCheck bool) *Balancer {
 	balancer := &Balancer{
 		status:           make(map[string]struct{}),
-		wantsHealthCheck: hc != nil,
+		fenced:           make(map[string]struct{}),
+		wantsHealthCheck: wantsHealthCheck,
 	}
 	if sticky != nil && sticky.Cookie != nil {
-		balancer.stickyCookie = &stickyCookie{
-			name:     sticky.Cookie.Name,
-			secure:   sticky.Cookie.Secure,
-			httpOnly: sticky.Cookie.HTTPOnly,
-		}
+		balancer.sticky = loadbalancer.NewSticky(*sticky.Cookie)
 	}
+
 	return balancer
 }
 
@@ -77,7 +79,7 @@ func (b *Balancer) Swap(i, j int) {
 }
 
 // Push implements heap.Interface for pushing an item into the heap.
-func (b *Balancer) Push(x interface{}) {
+func (b *Balancer) Push(x any) {
 	h, ok := x.(*namedHandler)
 	if !ok {
 		return
@@ -86,19 +88,19 @@ func (b *Balancer) Push(x interface{}) {
 	b.handlers = append(b.handlers, h)
 }
 
-// Pop implements heap.Interface for poping an item from the heap.
+// Pop implements heap.Interface for popping an item from the heap.
 // It panics if b.Len() < 1.
-func (b *Balancer) Pop() interface{} {
+func (b *Balancer) Pop() any {
 	h := b.handlers[len(b.handlers)-1]
 	b.handlers = b.handlers[0 : len(b.handlers)-1]
 	return h
 }
 
 // SetStatus sets on the balancer that its given child is now of the given
-// status. balancerName is only needed for logging purposes.
+// status. childName is only needed for logging purposes.
 func (b *Balancer) SetStatus(ctx context.Context, childName string, up bool) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
 
 	upBefore := len(b.status) > 0
 
@@ -106,7 +108,9 @@ func (b *Balancer) SetStatus(ctx context.Context, childName string, up bool) {
 	if up {
 		status = "UP"
 	}
-	log.FromContext(ctx).Debugf("Setting status of %s to %v", childName, status)
+
+	log.Ctx(ctx).Debug().Msgf("Setting status of %s to %v", childName, status)
+
 	if up {
 		b.status[childName] = struct{}{}
 	} else {
@@ -122,12 +126,12 @@ func (b *Balancer) SetStatus(ctx context.Context, childName string, up bool) {
 	// No Status Change
 	if upBefore == upAfter {
 		// We're still with the same status, no need to propagate
-		log.FromContext(ctx).Debugf("Still %s, no need to propagate", status)
+		log.Ctx(ctx).Debug().Msgf("Still %s, no need to propagate", status)
 		return
 	}
 
 	// Status Change
-	log.FromContext(ctx).Debugf("Propagating new %s status", status)
+	log.Ctx(ctx).Debug().Msgf("Propagating new %s status", status)
 	for _, fn := range b.updaters {
 		fn(upAfter)
 	}
@@ -138,22 +142,91 @@ func (b *Balancer) SetStatus(ctx context.Context, childName string, up bool) {
 // Not thread safe.
 func (b *Balancer) RegisterStatusUpdater(fn func(up bool)) error {
 	if !b.wantsHealthCheck {
-		return errors.New("healthCheck not enabled in config for this weighted service")
+		return errors.New("healthCheck not enabled in config for this WRR service")
 	}
 	b.updaters = append(b.updaters, fn)
 	return nil
 }
 
-var errNoAvailableServer = errors.New("no available server")
+func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if b.sticky != nil {
+		h, rewrite, err := b.sticky.StickyHandler(req)
+		if err != nil {
+			log.Error().Err(err).Msg("Error while getting sticky handler")
+		} else if h != nil {
+			b.handlersMu.RLock()
+			_, ok := b.status[h.Name]
+			b.handlersMu.RUnlock()
+			if ok {
+				if rewrite {
+					if err := b.sticky.WriteStickyCookie(rw, h.Name); err != nil {
+						log.Error().Err(err).Msg("Writing sticky cookie")
+					}
+				}
+
+				h.ServeHTTP(rw, req)
+				return
+			}
+		}
+	}
+
+	server, err := b.nextServer()
+	if err != nil {
+		if errors.Is(err, errNoAvailableServer) {
+			http.Error(rw, errNoAvailableServer.Error(), http.StatusServiceUnavailable)
+		} else {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	if b.sticky != nil {
+		if err := b.sticky.WriteStickyCookie(rw, server.name); err != nil {
+			log.Error().Err(err).Msg("Error while writing sticky cookie")
+		}
+	}
+
+	server.ServeHTTP(rw, req)
+}
+
+// AddServer adds a handler with a server.
+func (b *Balancer) AddServer(name string, handler http.Handler, server dynamic.Server) {
+	b.Add(name, handler, server.Weight, server.Fenced)
+}
+
+// Add adds a handler.
+// A handler with a non-positive weight is ignored.
+func (b *Balancer) Add(name string, handler http.Handler, weight *int, fenced bool) {
+	w := 1
+	if weight != nil {
+		w = *weight
+	}
+
+	if w <= 0 { // non-positive weight is meaningless
+		return
+	}
+
+	h := &namedHandler{Handler: handler, name: name, weight: float64(w)}
+
+	b.handlersMu.Lock()
+	h.deadline = b.curDeadline + 1/h.weight
+	heap.Push(b, h)
+	b.status[name] = struct{}{}
+	if fenced {
+		b.fenced[name] = struct{}{}
+	}
+	b.handlersMu.Unlock()
+
+	if b.sticky != nil {
+		b.sticky.AddHandler(name, handler)
+	}
+}
 
 func (b *Balancer) nextServer() (*namedHandler, error) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
 
-	if len(b.handlers) == 0 {
-		return nil, fmt.Errorf("no servers in the pool")
-	}
-	if len(b.status) == 0 {
+	if len(b.handlers) == 0 || len(b.status) == 0 || len(b.fenced) == len(b.handlers) {
 		return nil, errNoAvailableServer
 	}
 
@@ -168,77 +241,13 @@ func (b *Balancer) nextServer() (*namedHandler, error) {
 
 		heap.Push(b, handler)
 		if _, ok := b.status[handler.name]; ok {
-			break
-		}
-	}
-
-	log.WithoutContext().Debugf("Service selected by WRR: %s", handler.name)
-	return handler, nil
-}
-
-func (b *Balancer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if b.stickyCookie != nil {
-		cookie, err := req.Cookie(b.stickyCookie.name)
-
-		if err != nil && !errors.Is(err, http.ErrNoCookie) {
-			log.WithoutContext().Warnf("Error while reading cookie: %v", err)
-		}
-
-		if err == nil && cookie != nil {
-			for _, handler := range b.handlers {
-				if handler.name != cookie.Value {
-					continue
-				}
-
-				b.mutex.RLock()
-				_, ok := b.status[handler.name]
-				b.mutex.RUnlock()
-				if !ok {
-					// because we already are in the only iteration that matches the cookie, so none
-					// of the following iterations are going to be a match for the cookie anyway.
-					break
-				}
-
-				handler.ServeHTTP(w, req)
-				return
+			if _, ok := b.fenced[handler.name]; !ok {
+				// do not select a fenced handler.
+				break
 			}
 		}
 	}
 
-	server, err := b.nextServer()
-	if err != nil {
-		if errors.Is(err, errNoAvailableServer) {
-			http.Error(w, errNoAvailableServer.Error(), http.StatusServiceUnavailable)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
-
-	if b.stickyCookie != nil {
-		cookie := &http.Cookie{Name: b.stickyCookie.name, Value: server.name, Path: "/", HttpOnly: b.stickyCookie.httpOnly, Secure: b.stickyCookie.secure}
-		http.SetCookie(w, cookie)
-	}
-
-	server.ServeHTTP(w, req)
-}
-
-// AddService adds a handler.
-// A handler with a non-positive weight is ignored.
-func (b *Balancer) AddService(name string, handler http.Handler, weight *int) {
-	w := 1
-	if weight != nil {
-		w = *weight
-	}
-	if w <= 0 { // non-positive weight is meaningless
-		return
-	}
-
-	h := &namedHandler{Handler: handler, name: name, weight: float64(w)}
-
-	b.mutex.Lock()
-	h.deadline = b.curDeadline + 1/h.weight
-	heap.Push(b, h)
-	b.status[name] = struct{}{}
-	b.mutex.Unlock()
+	log.Debug().Msgf("Service selected by WRR: %s", handler.name)
+	return handler, nil
 }

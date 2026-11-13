@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -22,8 +23,10 @@ type pageInfo struct {
 }
 
 type searchCriterion struct {
-	Search string `url:"search"`
-	Status string `url:"status"`
+	Search         string `url:"search"`
+	Status         string `url:"status"`
+	ServiceName    string `url:"serviceName"`
+	MiddlewareName string `url:"middlewareName"`
 }
 
 func newSearchCriterion(query url.Values) *searchCriterion {
@@ -33,12 +36,19 @@ func newSearchCriterion(query url.Values) *searchCriterion {
 
 	search := query.Get("search")
 	status := query.Get("status")
+	serviceName := query.Get("serviceName")
+	middlewareName := query.Get("middlewareName")
 
-	if status == "" && search == "" {
+	if status == "" && search == "" && serviceName == "" && middlewareName == "" {
 		return nil
 	}
 
-	return &searchCriterion{Search: search, Status: status}
+	return &searchCriterion{
+		Search:         search,
+		Status:         status,
+		ServiceName:    serviceName,
+		MiddlewareName: middlewareName,
+	}
 }
 
 func (c *searchCriterion) withStatus(name string) bool {
@@ -50,16 +60,34 @@ func (c *searchCriterion) searchIn(values ...string) bool {
 		return true
 	}
 
-	for _, v := range values {
-		if strings.Contains(strings.ToLower(v), strings.ToLower(c.Search)) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(values, func(v string) bool {
+		return strings.Contains(strings.ToLower(v), strings.ToLower(c.Search))
+	})
 }
 
-func pagination(request *http.Request, max int) (pageInfo, error) {
+func (c *searchCriterion) filterService(name string) bool {
+	if c.ServiceName == "" {
+		return true
+	}
+
+	if strings.Contains(name, "@") {
+		return c.ServiceName == name
+	}
+
+	before, _, _ := strings.Cut(c.ServiceName, "@")
+
+	return before == name
+}
+
+func (c *searchCriterion) filterMiddleware(mns []string) bool {
+	if c.MiddlewareName == "" {
+		return true
+	}
+
+	return slices.Contains(mns, c.MiddlewareName)
+}
+
+func pagination(request *http.Request, maximum int) (pageInfo, error) {
 	perPage, err := getIntParam(request, "per_page", defaultPerPage)
 	if err != nil {
 		return pageInfo{}, err
@@ -71,17 +99,14 @@ func pagination(request *http.Request, max int) (pageInfo, error) {
 	}
 
 	startIndex := (page - 1) * perPage
-	if startIndex != 0 && startIndex >= max {
+	if startIndex != 0 && startIndex >= maximum {
 		return pageInfo{}, fmt.Errorf("invalid request: page: %d, per_page: %d", page, perPage)
 	}
 
-	endIndex := startIndex + perPage
-	if endIndex >= max {
-		endIndex = max
-	}
+	endIndex := min(startIndex+perPage, maximum)
 
 	nextPage := 1
-	if page*perPage < max {
+	if page*perPage < maximum {
 		nextPage = page + 1
 	}
 

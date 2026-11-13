@@ -1,29 +1,30 @@
 package udp
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/server/provider"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/server/provider"
 )
 
 func TestManager_BuildUDP(t *testing.T) {
 	testCases := []struct {
-		desc          string
-		serviceName   string
-		configs       map[string]*runtime.UDPServiceInfo
-		providerName  string
-		expectedError string
+		desc           string
+		serviceName    string
+		configs        map[string]*runtime.UDPServiceInfo
+		providerName   string
+		expectedError  string
+		expectedStatus string
+		expectedErrs   []string
 	}{
 		{
 			desc:          "without configuration",
 			serviceName:   "test",
 			configs:       nil,
-			expectedError: `the udp service "test" does not exist`,
+			expectedError: `the UDP service "test" does not exist`,
 		},
 		{
 			desc:        "missing lb configuration",
@@ -33,7 +34,7 @@ func TestManager_BuildUDP(t *testing.T) {
 					UDPService: &dynamic.UDPService{},
 				},
 			},
-			expectedError: `the udp service "test" does not have any type defined`,
+			expectedError: `the UDP service "test" does not have any type defined`,
 		},
 		{
 			desc:        "no such host, server is skipped, error is logged",
@@ -171,10 +172,45 @@ func TestManager_BuildUDP(t *testing.T) {
 			},
 			providerName: "provider-1",
 		},
+		{
+			desc:        "negative weight in a weighted service",
+			serviceName: "test",
+			configs: map[string]*runtime.UDPServiceInfo{
+				"test": {
+					UDPService: &dynamic.UDPService{
+						Weighted: &dynamic.UDPWeightedRoundRobin{
+							Services: []dynamic.UDPWRRService{
+								{Name: "child", Weight: new(-2)},
+							},
+						},
+					},
+				},
+			},
+			expectedError:  `invalid negative weight -2 for UDP service "child"`,
+			expectedStatus: runtime.StatusDisabled,
+			expectedErrs:   []string{`invalid negative weight -2 for UDP service "child"`},
+		},
+		{
+			desc:        "child service error is reported on the parent weighted service",
+			serviceName: "test",
+			configs: map[string]*runtime.UDPServiceInfo{
+				"test": {
+					UDPService: &dynamic.UDPService{
+						Weighted: &dynamic.UDPWeightedRoundRobin{
+							Services: []dynamic.UDPWRRService{
+								{Name: "child"},
+							},
+						},
+					},
+				},
+			},
+			expectedError:  `the UDP service "child" does not exist`,
+			expectedStatus: runtime.StatusDisabled,
+			expectedErrs:   []string{`the UDP service "child" does not exist`},
+		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -182,7 +218,7 @@ func TestManager_BuildUDP(t *testing.T) {
 				UDPServices: test.configs,
 			})
 
-			ctx := context.Background()
+			ctx := t.Context()
 			if len(test.providerName) > 0 {
 				ctx = provider.AddInContext(ctx, "foobar@"+test.providerName)
 			}
@@ -195,6 +231,14 @@ func TestManager_BuildUDP(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 				require.NotNil(t, handler)
+			}
+
+			if test.expectedStatus != "" {
+				serviceInfo := test.configs[provider.GetQualifiedName(ctx, test.serviceName)]
+				require.NotNil(t, serviceInfo)
+
+				assert.Equal(t, test.expectedStatus, serviceInfo.Status)
+				assert.Equal(t, test.expectedErrs, serviceInfo.Err)
 			}
 		})
 	}

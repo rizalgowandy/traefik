@@ -1,4 +1,3 @@
-whoami1:
-  image: traefik/whoami
-  ports:
-    - "8881:80"
+services:
+  whoami1:
+    image: traefik/whoami:v1.12.0

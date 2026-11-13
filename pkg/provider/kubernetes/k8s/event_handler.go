@@ -1,44 +1,45 @@
 package k8s
 
 import (
-	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 // ResourceEventHandler handles Add, Update or Delete Events for resources.
 type ResourceEventHandler struct {
-	Ev chan<- interface{}
+	Ev chan<- any
 }
 
 // OnAdd is called on Add Events.
-func (reh *ResourceEventHandler) OnAdd(obj interface{}) {
+func (reh *ResourceEventHandler) OnAdd(obj any, _ bool) {
 	eventHandlerFunc(reh.Ev, obj)
 }
 
 // OnUpdate is called on Update Events.
 // Ignores useless changes.
-func (reh *ResourceEventHandler) OnUpdate(oldObj, newObj interface{}) {
+func (reh *ResourceEventHandler) OnUpdate(oldObj, newObj any) {
 	if objChanged(oldObj, newObj) {
 		eventHandlerFunc(reh.Ev, newObj)
 	}
 }
 
 // OnDelete is called on Delete Events.
-func (reh *ResourceEventHandler) OnDelete(obj interface{}) {
+func (reh *ResourceEventHandler) OnDelete(obj any) {
 	eventHandlerFunc(reh.Ev, obj)
 }
 
 // eventHandlerFunc will pass the obj on to the events channel or drop it.
 // This is so passing the events along won't block in the case of high volume.
 // The events are only used for signaling anyway so dropping a few is ok.
-func eventHandlerFunc(events chan<- interface{}, obj interface{}) {
+func eventHandlerFunc(events chan<- any, obj any) {
 	select {
 	case events <- obj:
 	default:
 	}
 }
 
-func objChanged(oldObj, newObj interface{}) bool {
+func objChanged(oldObj, newObj any) bool {
 	if oldObj == nil || newObj == nil {
 		return true
 	}
@@ -47,21 +48,39 @@ func objChanged(oldObj, newObj interface{}) bool {
 		return false
 	}
 
-	if _, ok := oldObj.(*corev1.Endpoints); ok {
-		return endpointsChanged(oldObj.(*corev1.Endpoints), newObj.(*corev1.Endpoints))
+	if _, ok := oldObj.(*discoveryv1.EndpointSlice); ok {
+		return endpointSliceChanged(oldObj.(*discoveryv1.EndpointSlice), newObj.(*discoveryv1.EndpointSlice))
 	}
 
 	return true
 }
 
-func endpointsChanged(a, b *corev1.Endpoints) bool {
-	if len(a.Subsets) != len(b.Subsets) {
+// In some Kubernetes versions leader election is done by updating an endpoint annotation every second,
+// if there are no changes to the endpoints addresses, ports, and there are no addresses defined for an endpoint
+// the event can safely be ignored and won't cause unnecessary config reloads.
+// TODO: check if Kubernetes is still using EndpointSlice for leader election, which seems to not be the case anymore.
+func endpointSliceChanged(a, b *discoveryv1.EndpointSlice) bool {
+	if len(a.Ports) != len(b.Ports) {
 		return true
 	}
 
-	for i, sa := range a.Subsets {
-		sb := b.Subsets[i]
-		if subsetsChanged(sa, sb) {
+	for i, aport := range a.Ports {
+		bport := b.Ports[i]
+		if aport.Name != bport.Name {
+			return true
+		}
+		if aport.Port != bport.Port {
+			return true
+		}
+	}
+
+	if len(a.Endpoints) != len(b.Endpoints) {
+		return true
+	}
+
+	for i, ea := range a.Endpoints {
+		eb := b.Endpoints[i]
+		if endpointChanged(ea, eb) {
 			return true
 		}
 	}
@@ -69,41 +88,25 @@ func endpointsChanged(a, b *corev1.Endpoints) bool {
 	return false
 }
 
-func subsetsChanged(sa, sb corev1.EndpointSubset) bool {
-	if len(sa.Addresses) != len(sb.Addresses) {
+func endpointChanged(a, b discoveryv1.Endpoint) bool {
+	if len(a.Addresses) != len(b.Addresses) {
 		return true
 	}
 
-	if len(sa.Ports) != len(sb.Ports) {
+	for i, aaddr := range a.Addresses {
+		baddr := b.Addresses[i]
+		if aaddr != baddr {
+			return true
+		}
+	}
+
+	// A nil condition has a defined meaning that consumers resolve with the same defaults
+	// (Ready and Serving default to true, Terminating to false), so comparison must use those
+	// defaults to avoid reporting a nil-to-default transition as a change.
+	if ptr.Deref(a.Conditions.Ready, true) != ptr.Deref(b.Conditions.Ready, true) ||
+		ptr.Deref(a.Conditions.Serving, true) != ptr.Deref(b.Conditions.Serving, true) ||
+		ptr.Deref(a.Conditions.Terminating, false) != ptr.Deref(b.Conditions.Terminating, false) {
 		return true
-	}
-
-	// in Addresses and Ports, we should be able to rely on
-	// these being sorted and able to be compared
-	// they are supposed to be in a canonical format
-	for addr, aaddr := range sa.Addresses {
-		baddr := sb.Addresses[addr]
-		if aaddr.IP != baddr.IP {
-			return true
-		}
-
-		if aaddr.Hostname != baddr.Hostname {
-			return true
-		}
-	}
-
-	for port, aport := range sa.Ports {
-		bport := sb.Ports[port]
-		if aport.Name != bport.Name {
-			return true
-		}
-		if aport.Port != bport.Port {
-			return true
-		}
-
-		if aport.Protocol != bport.Protocol {
-			return true
-		}
 	}
 
 	return false

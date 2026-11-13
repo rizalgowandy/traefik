@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/traefik/paerser/cli"
-	"github.com/traefik/traefik/v2/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/config/static"
 )
 
 // NewCmd builds a new HealthCheck command.
@@ -61,10 +61,15 @@ func Do(staticConfiguration static.Configuration) (*http.Response, error) {
 		return nil, fmt.Errorf("ping: missing %s entry point", ep)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+		},
+	}
 	protocol := "http"
 
-	// FIXME Handle TLS on ping etc...
+	// TODO Handle TLS on ping etc...
 	// if pingEntryPoint.TLS != nil {
 	// 	protocol = "https"
 	// 	tr := &http.Transport{

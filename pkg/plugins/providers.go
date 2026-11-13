@@ -9,10 +9,13 @@ import (
 	"strings"
 
 	"github.com/mitchellh/mapstructure"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/log"
-	"github.com/traefik/traefik/v2/pkg/provider"
-	"github.com/traefik/traefik/v2/pkg/safe"
+	"github.com/rs/zerolog/log"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/observability/logs"
+	"github.com/traefik/traefik/v3/pkg/provider"
+	"github.com/traefik/traefik/v3/pkg/safe"
+	"github.com/traefik/yaegi/interp"
+	"github.com/traefik/yaegi/v2/vm"
 )
 
 // PP the interface of a plugin's provider.
@@ -23,7 +26,7 @@ type PP interface {
 }
 
 type _PP struct {
-	IValue   interface{}
+	IValue   any
 	WInit    func() error
 	WProvide func(cfgChan chan<- json.Marshaler) error
 	WStop    func() error
@@ -43,7 +46,7 @@ func (p _PP) Stop() error {
 
 func ppSymbols() map[string]map[string]reflect.Value {
 	return map[string]map[string]reflect.Value{
-		"github.com/traefik/traefik/v2/pkg/plugins/plugins": {
+		"github.com/traefik/traefik/v3/pkg/plugins/plugins": {
 			"PP":  reflect.ValueOf((*PP)(nil)),
 			"_PP": reflect.ValueOf((*_PP)(nil)),
 		},
@@ -51,17 +54,30 @@ func ppSymbols() map[string]map[string]reflect.Value {
 }
 
 // BuildProvider builds a plugin's provider.
-func (b Builder) BuildProvider(pName string, config map[string]interface{}) (provider.Provider, error) {
-	if b.providerDescriptors == nil {
+func (b Builder) BuildProvider(pName string, config map[string]any) (provider.Provider, error) {
+	if b.providerBuilders == nil {
 		return nil, fmt.Errorf("no plugin definition in the static configuration: %s", pName)
 	}
 
-	descriptor, ok := b.providerDescriptors[pName]
+	builder, ok := b.providerBuilders[pName]
 	if !ok {
 		return nil, fmt.Errorf("unknown plugin type: %s", pName)
 	}
 
-	return newProvider(descriptor, config, "plugin-"+pName)
+	return newProvider(builder, config, "plugin-"+pName)
+}
+
+type providerBuilder struct {
+	// Import plugin's import/package
+	Import string `json:"import,omitempty" toml:"import,omitempty" yaml:"import,omitempty"`
+
+	// BasePkg plugin's base package name (optional)
+	BasePkg string `json:"basePkg,omitempty" toml:"basePkg,omitempty" yaml:"basePkg,omitempty"`
+
+	interpreter *interp.Interpreter
+
+	// plugin is set when Yaegi v2 runs the plugin, interpreter otherwise.
+	plugin *vm.Plugin
 }
 
 // Provider is a plugin's provider wrapper.
@@ -70,13 +86,17 @@ type Provider struct {
 	pp   PP
 }
 
-func newProvider(descriptor pluginContext, config map[string]interface{}, providerName string) (*Provider, error) {
-	basePkg := descriptor.BasePkg
-	if basePkg == "" {
-		basePkg = strings.ReplaceAll(path.Base(descriptor.Import), "-", "_")
+func newProvider(builder providerBuilder, config map[string]any, providerName string) (*Provider, error) {
+	if builder.plugin != nil {
+		return newYaegiV2Provider(builder.plugin, config, providerName)
 	}
 
-	vConfig, err := descriptor.interpreter.Eval(basePkg + `.CreateConfig()`)
+	basePkg := builder.BasePkg
+	if basePkg == "" {
+		basePkg = strings.ReplaceAll(path.Base(builder.Import), "-", "_")
+	}
+
+	vConfig, err := builder.interpreter.Eval(basePkg + `.CreateConfig()`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to eval CreateConfig: %w", err)
 	}
@@ -97,13 +117,13 @@ func newProvider(descriptor pluginContext, config map[string]interface{}, provid
 		return nil, fmt.Errorf("failed to decode configuration: %w", err)
 	}
 
-	_, err = descriptor.interpreter.Eval(`package wrapper
+	_, err = builder.interpreter.Eval(`package wrapper
 
 import (
 	"context"
 
-	` + basePkg + ` "` + descriptor.Import + `"
-	"github.com/traefik/traefik/v2/pkg/plugins"
+	` + basePkg + ` "` + builder.Import + `"
+	"github.com/traefik/traefik/v3/pkg/plugins"
 )
 
 func NewWrapper(ctx context.Context, config *` + basePkg + `.Config, name string) (plugins.PP, error) {
@@ -116,7 +136,7 @@ func NewWrapper(ctx context.Context, config *` + basePkg + `.Config, name string
 		return nil, fmt.Errorf("failed to eval wrapper: %w", err)
 	}
 
-	fnNew, err := descriptor.interpreter.Eval("wrapper.NewWrapper")
+	fnNew, err := builder.interpreter.Eval("wrapper.NewWrapper")
 	if err != nil {
 		return nil, fmt.Errorf("failed to eval New: %w", err)
 	}
@@ -130,7 +150,7 @@ func NewWrapper(ctx context.Context, config *` + basePkg + `.Config, name string
 		return nil, results[1].Interface().(error)
 	}
 
-	prov, ok := results[0].Interface().(PP)
+	prov, ok := reflect.TypeAssert[PP](results[0])
 	if !ok {
 		return nil, fmt.Errorf("invalid provider type: %T", results[0].Interface())
 	}
@@ -147,26 +167,21 @@ func (p *Provider) Init() error {
 func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.Pool) error {
 	defer func() {
 		if err := recover(); err != nil {
-			log.WithoutContext().WithField(log.ProviderName, p.name).Errorf("panic inside the plugin %v", err)
+			log.Error().Str(logs.ProviderName, p.name).Msgf("Panic inside the plugin %v", err)
 		}
 	}()
 
 	cfgChan := make(chan json.Marshaler)
 
-	err := p.pp.Provide(cfgChan)
-	if err != nil {
-		return fmt.Errorf("error from %s: %w", p.name, err)
-	}
-
 	pool.GoCtx(func(ctx context.Context) {
-		logger := log.FromContext(log.With(ctx, log.Str(log.ProviderName, p.name)))
+		logger := log.Ctx(ctx).With().Str(logs.ProviderName, p.name).Logger()
 
 		for {
 			select {
 			case <-ctx.Done():
 				err := p.pp.Stop()
 				if err != nil {
-					logger.Errorf("failed to stop the provider: %v", err)
+					logger.Error().Err(err).Msg("Failed to stop the provider")
 				}
 
 				return
@@ -174,14 +189,14 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 			case cfgPg := <-cfgChan:
 				marshalJSON, err := cfgPg.MarshalJSON()
 				if err != nil {
-					logger.Errorf("failed to marshal configuration: %v", err)
+					logger.Error().Err(err).Msg("Failed to marshal configuration")
 					continue
 				}
 
 				cfg := &dynamic.Configuration{}
 				err = json.Unmarshal(marshalJSON, cfg)
 				if err != nil {
-					logger.Errorf("failed to unmarshal configuration: %v", err)
+					logger.Error().Err(err).Msg("Failed to unmarshal configuration")
 					continue
 				}
 
@@ -192,6 +207,11 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 			}
 		}
 	})
+
+	err := p.pp.Provide(cfgChan)
+	if err != nil {
+		return fmt.Errorf("error from %s: %w", p.name, err)
+	}
 
 	return nil
 }

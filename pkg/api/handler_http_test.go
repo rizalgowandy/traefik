@@ -1,24 +1,22 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/traefik/traefik/v2/pkg/config/dynamic"
-	"github.com/traefik/traefik/v2/pkg/config/runtime"
-	"github.com/traefik/traefik/v2/pkg/config/static"
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/config/static"
 )
-
-func Bool(v bool) *bool { return &v }
 
 func TestHandler_HTTP(t *testing.T) {
 	type expected struct {
@@ -203,6 +201,84 @@ func TestHandler_HTTP(t *testing.T) {
 			},
 		},
 		{
+			desc: "routers filtered by service",
+			path: "/api/http/routers?serviceName=fii-service@myprovider",
+			conf: runtime.Configuration{
+				Routers: map[string]*runtime.RouterInfo{
+					"test@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "fii-service@myprovider",
+							Rule:        "Host(`fii.bar.other`)",
+							Middlewares: []string{"addPrefixTest", "auth"},
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"foo@otherprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "fii-service",
+							Rule:        "Host(`fii.foo.other`)",
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"bar@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.bar`)",
+							Middlewares: []string{"auth", "addPrefixTest@anotherprovider"},
+						},
+						Status: runtime.StatusDisabled,
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				nextPage:   "1",
+				jsonFile:   "testdata/routers-filtered-serviceName.json",
+			},
+		},
+		{
+			desc: "routers filtered by middleware",
+			path: "/api/http/routers?middlewareName=auth",
+			conf: runtime.Configuration{
+				Routers: map[string]*runtime.RouterInfo{
+					"test@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "fii-service@myprovider",
+							Rule:        "Host(`fii.bar.other`)",
+							Middlewares: []string{"addPrefixTest", "auth"},
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"foo@otherprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "fii-service",
+							Rule:        "Host(`fii.foo.other`)",
+						},
+						Status: runtime.StatusEnabled,
+					},
+					"bar@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.bar`)",
+							Middlewares: []string{"auth", "addPrefixTest@anotherprovider"},
+						},
+						Status: runtime.StatusDisabled,
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				nextPage:   "1",
+				jsonFile:   "testdata/routers-filtered-middlewareName.json",
+			},
+		},
+		{
 			desc: "one router by id",
 			path: "/api/http/routers/bar@myprovider",
 			conf: runtime.Configuration{
@@ -221,6 +297,73 @@ func TestHandler_HTTP(t *testing.T) {
 			expected: expected{
 				statusCode: http.StatusOK,
 				jsonFile:   "testdata/router-bar.json",
+			},
+		},
+		{
+			desc: "one router by id containing slash",
+			path: "/api/http/routers/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				Routers: map[string]*runtime.RouterInfo{
+					"foo / bar@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.bar`)",
+							Middlewares: []string{"auth", "addPrefixTest@anotherprovider"},
+						},
+						Status: "enabled",
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/router-foo-slash-bar.json",
+			},
+		},
+		{
+			desc: "one router by id, implicitly using default TLS options",
+			path: "/api/http/routers/baz@myprovider",
+			conf: runtime.Configuration{
+				Routers: map[string]*runtime.RouterInfo{
+					"baz@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.baz`)",
+							Middlewares: []string{"auth", "addPrefixTest@anotherprovider"},
+							TLS:         &dynamic.RouterTLSConfig{},
+						},
+						Status: "enabled",
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/router-baz-default-tls-options.json",
+			},
+		},
+		{
+			desc: "one router by id, using specific TLS options",
+			path: "/api/http/routers/baz@myprovider",
+			conf: runtime.Configuration{
+				Routers: map[string]*runtime.RouterInfo{
+					"baz@myprovider": {
+						Router: &dynamic.Router{
+							EntryPoints: []string{"web"},
+							Service:     "foo-service@myprovider",
+							Rule:        "Host(`foo.baz`)",
+							Middlewares: []string{"auth", "addPrefixTest@anotherprovider"},
+							TLS: &dynamic.RouterTLSConfig{
+								Options: "myTLS",
+							},
+						},
+						Status: "enabled",
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/router-baz-custom-tls-options.json",
 			},
 		},
 		{
@@ -269,7 +412,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.1",
@@ -286,7 +429,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.2",
@@ -355,7 +498,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.1",
@@ -372,7 +515,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.2",
@@ -389,7 +532,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.3",
@@ -419,7 +562,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.1",
@@ -437,7 +580,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.2",
@@ -468,7 +611,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.1",
@@ -486,7 +629,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.2",
@@ -517,7 +660,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.1",
@@ -538,6 +681,35 @@ func TestHandler_HTTP(t *testing.T) {
 			},
 		},
 		{
+			desc: "one service by id containing slash",
+			path: "/api/http/services/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				Services: map[string]*runtime.ServiceInfo{
+					"foo / bar@myprovider": func() *runtime.ServiceInfo {
+						si := &runtime.ServiceInfo{
+							Service: &dynamic.Service{
+								LoadBalancer: &dynamic.ServersLoadBalancer{
+									PassHostHeader: new(true),
+									Servers: []dynamic.Server{
+										{
+											URL: "http://127.0.0.1",
+										},
+									},
+								},
+							},
+							UsedBy: []string{"foo@myprovider", "test@myprovider"},
+						}
+						si.UpdateServerStatus("http://127.0.0.1", "UP")
+						return si
+					}(),
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/service-foo-slash-bar.json",
+			},
+		},
+		{
 			desc: "one service by id, that does not exist",
 			path: "/api/http/services/nono@myprovider",
 			conf: runtime.Configuration{
@@ -546,7 +718,7 @@ func TestHandler_HTTP(t *testing.T) {
 						si := &runtime.ServiceInfo{
 							Service: &dynamic.Service{
 								LoadBalancer: &dynamic.ServersLoadBalancer{
-									PassHostHeader: Bool(true),
+									PassHostHeader: new(true),
 									Servers: []dynamic.Server{
 										{
 											URL: "http://127.0.0.1",
@@ -774,6 +946,26 @@ func TestHandler_HTTP(t *testing.T) {
 			},
 		},
 		{
+			desc: "one middleware by id containing slash",
+			path: "/api/http/middlewares/" + url.PathEscape("foo / bar@myprovider"),
+			conf: runtime.Configuration{
+				Middlewares: map[string]*runtime.MiddlewareInfo{
+					"foo / bar@myprovider": {
+						Middleware: &dynamic.Middleware{
+							AddPrefix: &dynamic.AddPrefix{
+								Prefix: "/titi",
+							},
+						},
+						UsedBy: []string{"test@myprovider"},
+					},
+				},
+			},
+			expected: expected{
+				statusCode: http.StatusOK,
+				jsonFile:   "testdata/middleware-foo-slash-bar.json",
+			},
+		},
+		{
 			desc: "one middleware by id, that does not exist",
 			path: "/api/http/middlewares/foo@myprovider",
 			conf: runtime.Configuration{
@@ -803,14 +995,14 @@ func TestHandler_HTTP(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			rtConf := &test.conf
 			// To lazily initialize the Statuses.
 			rtConf.PopulateUsedBy()
-			rtConf.GetRoutersByEntryPoints(context.Background(), []string{"web"}, false)
+			rtConf.GetRoutersByEntryPoints(t.Context(), []string{"web"}, false)
+			rtConf.GetRoutersByEntryPoints(t.Context(), []string{"web"}, true)
 
 			handler := New(static.Configuration{API: &static.API{}, Global: &static.Global{}}, rtConf)
 			server := httptest.NewServer(handler.createRouter())
@@ -826,7 +1018,7 @@ func TestHandler_HTTP(t *testing.T) {
 				return
 			}
 
-			assert.Equal(t, resp.Header.Get("Content-Type"), "application/json")
+			assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 			contents, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
@@ -834,7 +1026,7 @@ func TestHandler_HTTP(t *testing.T) {
 			require.NoError(t, err)
 
 			if *updateExpected {
-				var results interface{}
+				var results any
 				err := json.Unmarshal(contents, &results)
 				require.NoError(t, err)
 
@@ -854,7 +1046,7 @@ func TestHandler_HTTP(t *testing.T) {
 
 func generateHTTPRouters(nbRouters int) map[string]*runtime.RouterInfo {
 	routers := make(map[string]*runtime.RouterInfo, nbRouters)
-	for i := 0; i < nbRouters; i++ {
+	for i := range nbRouters {
 		routers[fmt.Sprintf("bar%2d@myprovider", i)] = &runtime.RouterInfo{
 			Router: &dynamic.Router{
 				EntryPoints: []string{"web"},

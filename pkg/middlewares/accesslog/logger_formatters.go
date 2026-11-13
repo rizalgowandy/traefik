@@ -3,6 +3,7 @@ package accesslog
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -40,8 +41,8 @@ func (f *CommonLogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 		toLog(entry.Data, RequestMethod, defaultValue, false),
 		toLog(entry.Data, RequestPath, defaultValue, false),
 		toLog(entry.Data, RequestProtocol, defaultValue, false),
-		toLog(entry.Data, OriginStatus, defaultValue, true),
-		toLog(entry.Data, OriginContentSize, defaultValue, true),
+		toLog(entry.Data, DownstreamStatus, defaultValue, true),
+		toLog(entry.Data, DownstreamContentSize, defaultValue, true),
 		toLog(entry.Data, "request_Referer", `"-"`, true),
 		toLog(entry.Data, "request_User-Agent", `"-"`, true),
 		toLog(entry.Data, RequestCount, defaultValue, true),
@@ -52,7 +53,36 @@ func (f *CommonLogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	return b.Bytes(), err
 }
 
-func toLog(fields logrus.Fields, key, defaultValue string, quoted bool) interface{} {
+// GenericCLFLogFormatter provides formatting in the generic CLF log format.
+type GenericCLFLogFormatter struct{}
+
+// Format formats the log entry in the generic CLF log format.
+func (f *GenericCLFLogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	b := &bytes.Buffer{}
+
+	timestamp := defaultValue
+	if v, ok := entry.Data[StartUTC]; ok {
+		timestamp = v.(time.Time).Format(commonLogTimeFormat)
+	} else if v, ok := entry.Data[StartLocal]; ok {
+		timestamp = v.(time.Time).Local().Format(commonLogTimeFormat)
+	}
+
+	_, err := fmt.Fprintf(b, "%s - %s [%s] \"%s %s %s\" %v %v %s %s\n",
+		toLog(entry.Data, ClientHost, defaultValue, false),
+		toLog(entry.Data, ClientUsername, defaultValue, false),
+		timestamp,
+		toLog(entry.Data, RequestMethod, defaultValue, false),
+		toLog(entry.Data, RequestPath, defaultValue, false),
+		toLog(entry.Data, RequestProtocol, defaultValue, false),
+		toLog(entry.Data, DownstreamStatus, defaultValue, true),
+		toLog(entry.Data, DownstreamContentSize, defaultValue, true),
+		toLog(entry.Data, "request_Referer", `"-"`, true),
+		toLog(entry.Data, "request_User-Agent", `"-"`, true))
+
+	return b.Bytes(), err
+}
+
+func toLog(fields logrus.Fields, key, defaultValue string, quoted bool) any {
 	if v, ok := fields[key]; ok {
 		if v == nil {
 			return defaultValue
@@ -79,7 +109,7 @@ func toLogEntry(s, defaultValue string, quote bool) string {
 	}
 
 	if quote {
-		return `"` + s + `"`
+		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
 	}
 	return s
 }
